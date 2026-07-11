@@ -4,6 +4,8 @@
   2. scripts/01_build_features.py    (rebuild feature matrix)
   3. scripts/04_predict.py --date today   (early read — no bets logged)
   4. scripts/05_bankroll.py --settle      (settle yesterday's bets)
+  5. git commit+push of the betting-history files (bet log, bankroll state,
+     closing lines) — the only pipeline outputs that can't be regenerated.
 A failure in any step is logged and does not stop the remaining steps.
 
 Bet LOGGING intentionally does not happen here: at 8 AM neither lineups nor
@@ -70,6 +72,38 @@ def run_step(name, cmd, timeout=3600):
         return False
 
 
+def backup_betting_history():
+    """Commit + push the irreplaceable betting-history files (bet log,
+    bankroll state, captured closing lines) to the GitHub remote. Everything
+    else in data/models/outputs is regenerable and stays gitignored. No-op
+    when nothing changed since the last run.
+    """
+    import glob as _glob
+    files = ["outputs/bet_log.csv", "models/bankroll_state.json"]
+    files += sorted(_glob.glob("data/raw/odds_close_*.csv"))
+    existing = [f for f in files if (ROOT / f).exists()]
+    if not existing:
+        logger.info("backup: no betting-history files exist yet — skipping.")
+        return True
+    try:
+        subprocess.run(["git", "add", "--"] + existing, cwd=str(ROOT), check=True, capture_output=True)
+        staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(ROOT))
+        if staged.returncode == 0:
+            logger.info("backup: betting history unchanged — nothing to commit.")
+            return True
+        subprocess.run(["git", "commit", "-m", f"Betting history backup {today}"],
+                        cwd=str(ROOT), check=True, capture_output=True)
+        push = subprocess.run(["git", "push"], cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+        if push.returncode != 0:
+            logger.error(f"backup: commit created but push failed: {push.stderr.strip()[-200:]}")
+            return False
+        logger.info(f"backup: committed and pushed {len(existing)} betting-history file(s).")
+        return True
+    except Exception as e:
+        logger.error(f"backup: git step failed: {e}")
+        return False
+
+
 def main():
     logger.info(f"========== Daily run: {today} ==========")
     results = {}
@@ -87,6 +121,7 @@ def main():
     results["build features"] = run_step("build features", [str(PYTHON), "scripts/01_build_features.py"])
     results["predict"] = run_step("predict", [str(PYTHON), "scripts/04_predict.py", "--date", today])
     results["settle bets"] = run_step("settle bets", [str(PYTHON), "scripts/05_bankroll.py", "--settle"])
+    results["backup betting history"] = backup_betting_history()
 
     logger.info("========== SUMMARY ==========")
     for name, ok in results.items():
