@@ -33,7 +33,7 @@ consensus → quarter-Kelly bet logging with CLV tracking.
 
 ## Setup
 
-1. `python -m venv venv` and install deps into it; R 4.3 + `renv::restore()`.
+1. `python -m venv venv` then `venv\Scripts\python.exe -m pip install -r requirements.txt`; R 4.3 + `renv::restore()`.
 2. `.env` (never committed): `ODDS_API_KEY=...` (required),
    `SPORTSDATAIO_API_KEY=...` (optional).
 3. `Rscript R/00_run_all.R`, then scripts 01 → 02 → 04.
