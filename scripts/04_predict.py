@@ -204,6 +204,21 @@ def main():
         sys.exit(1)
     history = pd.read_csv(history_path)
 
+    # A run late enough in the day can hit games that finished since the last R
+    # refresh and are now sitting in history with a real result. Re-adding that
+    # game_pk as a fresh all-NaN placeholder would give it two home/two away
+    # rows after the concat below, and pivot_to_game_level's inner join on
+    # game_pk fans that out into duplicate (and partly stale) game cards.
+    completed_pks = set(history["game_pk"].astype(str))
+    finished_today = [g for g in games if g["game_pk"] in completed_pks]
+    if finished_today:
+        logger.info(f"{len(finished_today)} of today's games are already completed — excluding from the live "
+                     "schedule (real result already in game_logs_all.csv).")
+        games = [g for g in games if g["game_pk"] not in completed_pks]
+    if not games:
+        logger.warning(f"All of today's games ({date}) are already completed — nothing to predict.")
+        return
+
     today_rows = build_today_rows(games, date)
     combined = pd.concat([history, today_rows], ignore_index=True)
 
