@@ -48,14 +48,20 @@ def main():
     game_logs = pd.read_csv(game_logs_path)
     logger.info(f"game_logs_all: {len(game_logs)} rows")
 
-    fg_batting = _load_concat("fg_team_batting_{year}.csv", range(2020, 2026))
-    fg_sp = _load_concat("fg_sp_stats_{year}.csv", range(2020, 2026))
-    statcast_team = _load_concat("statcast_team_batting_{year}.csv", range(2020, 2026))
-    statcast_sp = _load_concat("statcast_sp_{year}.csv", range(2020, 2026))
-    team_fielding = _load_concat("team_fielding_{year}.csv", range(2020, 2026))
-    batter_stats = _load_concat("batter_stats_{year}.csv", range(2020, 2026))
-    lineups = _load_concat("lineups_{year}.csv", range(2021, 2027))
-    pitcher_gamelogs = _load_concat("pitcher_gamelogs_{year}.csv", range(2020, 2026))
+    # Ranges run through the season currently being played — current-season
+    # files are collected now (for in-season/as-of features and next year's
+    # prior-year joins), and the prior-year join keys make any same-season
+    # rows inert to existing features until explicitly used.
+    from datetime import date as _date
+    cur = _date.today().year
+    fg_batting = _load_concat("fg_team_batting_{year}.csv", range(2020, cur + 1))
+    fg_sp = _load_concat("fg_sp_stats_{year}.csv", range(2020, cur + 1))
+    statcast_team = _load_concat("statcast_team_batting_{year}.csv", range(2020, cur + 1))
+    statcast_sp = _load_concat("statcast_sp_{year}.csv", range(2020, cur + 1))
+    team_fielding = _load_concat("team_fielding_{year}.csv", range(2020, cur + 1))
+    batter_stats = _load_concat("batter_stats_{year}.csv", range(2020, cur + 1))
+    lineups = _load_concat("lineups_{year}.csv", range(2021, cur + 1))
+    pitcher_gamelogs = _load_concat("pitcher_gamelogs_{year}.csv", range(2020, cur + 1))
 
     player_bio_path = RAW / "player_bio.csv"
     player_bio = pd.read_csv(player_bio_path) if player_bio_path.exists() else pd.DataFrame()

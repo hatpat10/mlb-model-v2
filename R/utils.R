@@ -105,3 +105,17 @@ strip_accents <- function(x) {
 log_msg <- function(...) {
   cat(sprintf("[%s] %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), sprintf(...)))
 }
+
+#' The season being played right now. Collectors loop <start>:current_season()
+#' instead of a hardcoded range so they never silently stop collecting when
+#' a new season starts.
+current_season <- function() {
+  as.integer(format(Sys.Date(), "%Y"))
+}
+
+#' TRUE when `year` is a finished (immutable) season whose output file
+#' already exists — collectors skip the refetch entirely. The current
+#' season always re-collects so in-season stats stay fresh.
+skip_completed_season <- function(year, path) {
+  year < current_season() && file.exists(path)
+}

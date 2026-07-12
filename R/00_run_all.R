@@ -26,21 +26,20 @@ SCRIPTS <- c(
   "R/13_collect_player_bio.R"
 )
 
+CUR <- current_season()
 OUTPUT_GLOBS <- list(
-  "R/01_collect_gamelogs.R" = c("game_logs_2021.csv", "game_logs_2022.csv", "game_logs_2023.csv",
-                                 "game_logs_2024.csv", "game_logs_2025.csv", "game_logs_2026.csv",
-                                 "game_logs_all.csv"),
-  "R/02_collect_fg_batting.R" = sprintf("fg_team_batting_%d.csv", 2020:2025),
-  "R/03_collect_fg_pitching.R" = sprintf("fg_sp_stats_%d.csv", 2020:2025),
-  "R/04_collect_statcast_team.R" = sprintf("statcast_team_batting_%d.csv", 2020:2025),
-  "R/05_collect_statcast_sp.R" = sprintf("statcast_sp_%d.csv", 2020:2025),
+  "R/01_collect_gamelogs.R" = c(sprintf("game_logs_%d.csv", 2021:CUR), "game_logs_all.csv"),
+  "R/02_collect_fg_batting.R" = sprintf("fg_team_batting_%d.csv", 2020:CUR),
+  "R/03_collect_fg_pitching.R" = sprintf("fg_sp_stats_%d.csv", 2020:CUR),
+  "R/04_collect_statcast_team.R" = sprintf("statcast_team_batting_%d.csv", 2020:CUR),
+  "R/05_collect_statcast_sp.R" = sprintf("statcast_sp_%d.csv", 2020:CUR),
   "R/06_collect_park_factors.R" = c("park_factors.csv"),
   "R/07_collect_umpires.R" = c("umpire_assignments.csv", "umpire_factors.csv"),
   "R/08_collect_player_ids.R" = c("player_id_crosswalk.csv"),
-  "R/09_collect_team_fielding.R" = sprintf("team_fielding_%d.csv", 2020:2025),
-  "R/10_collect_batter_stats.R" = sprintf("batter_stats_%d.csv", 2020:2025),
-  "R/11_collect_pitcher_gamelogs.R" = sprintf("pitcher_gamelogs_%d.csv", 2020:2025),
-  "R/12_collect_lineups.R" = sprintf("lineups_%d.csv", 2021:2026),
+  "R/09_collect_team_fielding.R" = sprintf("team_fielding_%d.csv", 2020:CUR),
+  "R/10_collect_batter_stats.R" = sprintf("batter_stats_%d.csv", 2020:CUR),
+  "R/11_collect_pitcher_gamelogs.R" = sprintf("pitcher_gamelogs_%d.csv", 2020:CUR),
+  "R/12_collect_lineups.R" = sprintf("lineups_%d.csv", 2021:CUR),
   "R/13_collect_player_bio.R" = c("player_bio.csv")
 )
 

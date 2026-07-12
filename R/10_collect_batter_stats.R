@@ -21,10 +21,15 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2020:2025
+YEARS <- 2020:current_season()
 MIN_PA <- 50
 
 for (year in YEARS) {
+  out_path <- file.path(RAW_DIR, sprintf("batter_stats_%d.csv", year))
+  if (skip_completed_season(year, out_path)) {
+    log_msg("=== %d: finished season already collected, skipping ===", year)
+    next
+  }
   log_msg("=== %d: fetching FanGraphs individual batter stats ===", year)
 
   df <- tryCatch(
@@ -62,7 +67,6 @@ for (year in YEARS) {
     filter(!is.na(batter_name)) %>%
     distinct(batter_name, year, .keep_all = TRUE)
 
-  out_path <- file.path(RAW_DIR, sprintf("batter_stats_%d.csv", year))
   write_csv(out, out_path)
   log_msg("  wrote %s (%d rows, min %d PA)", out_path, nrow(out), MIN_PA)
 }

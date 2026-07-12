@@ -24,7 +24,7 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2021:2026
+YEARS <- 2021:current_season()
 
 all_years <- list()
 

@@ -18,9 +18,14 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2020:2025
+YEARS <- 2020:current_season()
 
 for (year in YEARS) {
+  out_path <- file.path(RAW_DIR, sprintf("statcast_team_batting_%d.csv", year))
+  if (skip_completed_season(year, out_path)) {
+    log_msg("=== %d: finished season already collected, skipping ===", year)
+    next
+  }
   log_msg("=== %d: building Statcast team batting quality ===", year)
 
   fgb <- tryCatch(
@@ -72,7 +77,6 @@ for (year in YEARS) {
     left_join(sprint_team, by = "team") %>%
     distinct(team, year, .keep_all = TRUE)
 
-  out_path <- file.path(RAW_DIR, sprintf("statcast_team_batting_%d.csv", year))
   write_csv(out, out_path)
   log_msg("  wrote %s (%d rows)", out_path, nrow(out))
 }

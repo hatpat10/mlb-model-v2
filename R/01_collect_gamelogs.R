@@ -15,7 +15,7 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2021:2026
+YEARS <- 2021:current_season()
 
 fetch_probables_cached <- function(game_pks, year) {
   cache_path <- file.path(RAW_DIR, sprintf("mlb_probables_cache_%d.csv", year))
@@ -71,6 +71,18 @@ fetch_probables_cached <- function(game_pks, year) {
 all_years_rows <- list()
 
 for (year in YEARS) {
+  gl_out_path <- file.path(RAW_DIR, sprintf("game_logs_%d.csv", year))
+  if (skip_completed_season(year, gl_out_path)) {
+    # Finished seasons never change — reuse the existing CSV (types
+    # re-normalized to match freshly-built rows) so game_logs_all.csv
+    # still spans every year without refetching the schedule.
+    log_msg("=== %d: finished season already collected, reusing CSV ===", year)
+    all_years_rows[[as.character(year)]] <- read_csv(gl_out_path, show_col_types = FALSE) %>%
+      mutate(game_pk = as.character(game_pk),
+             date = as.character(as.Date(date)),
+             day_of_week = as.character(day_of_week))
+    next
+  }
   log_msg("=== %d: fetching schedule ===", year)
 
   sched <- tryCatch(mlb_schedule(season = year, level_ids = "1"), error = function(e) {
@@ -164,9 +176,8 @@ for (year in YEARS) {
   n_dupes <- n_before - nrow(year_rows)
   log_msg("  %d rows, %d duplicate (game_pk, team) rows dropped", nrow(year_rows), n_dupes)
 
-  out_path <- file.path(RAW_DIR, sprintf("game_logs_%d.csv", year))
-  write_csv(year_rows, out_path)
-  log_msg("  wrote %s (%d rows)", out_path, nrow(year_rows))
+  write_csv(year_rows, gl_out_path)
+  log_msg("  wrote %s (%d rows)", gl_out_path, nrow(year_rows))
 
   all_years_rows[[as.character(year)]] <- year_rows
 }

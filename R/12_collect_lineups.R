@@ -18,7 +18,7 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2021:2026
+YEARS <- 2021:current_season()
 
 fetch_lineups_cached <- function(game_pks, year) {
   cache_path <- file.path(RAW_DIR, sprintf("lineups_cache_%d.csv", year))
@@ -74,6 +74,11 @@ fetch_lineups_cached <- function(game_pks, year) {
 }
 
 for (year in YEARS) {
+  out_path <- file.path(RAW_DIR, sprintf("lineups_%d.csv", year))
+  if (skip_completed_season(year, out_path)) {
+    log_msg("=== %d: finished season already collected, skipping ===", year)
+    next
+  }
   log_msg("=== %d: fetching starting lineups ===", year)
 
   gl_path <- file.path(RAW_DIR, sprintf("game_logs_%d.csv", year))
@@ -105,7 +110,6 @@ for (year in YEARS) {
     filter(!is.na(batter_mlbam_id)) %>%
     distinct(game_pk, batter_mlbam_id, .keep_all = TRUE)
 
-  out_path <- file.path(RAW_DIR, sprintf("lineups_%d.csv", year))
   write_csv(out, out_path)
   log_msg("  wrote %s (%d rows, %d games)", out_path, nrow(out), length(unique(out$game_pk)))
 }

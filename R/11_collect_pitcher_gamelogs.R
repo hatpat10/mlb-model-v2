@@ -19,9 +19,14 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2020:2025
+YEARS <- 2020:current_season()
 
 for (year in YEARS) {
+  out_path <- file.path(RAW_DIR, sprintf("pitcher_gamelogs_%d.csv", year))
+  if (skip_completed_season(year, out_path)) {
+    log_msg("=== %d: finished season already collected, skipping ===", year)
+    next
+  }
   log_msg("=== %d: fetching SP game logs ===", year)
 
   fg_path <- file.path(RAW_DIR, sprintf("fg_sp_stats_%d.csv", year))
@@ -71,7 +76,6 @@ for (year in YEARS) {
     filter(!is.na(pitcher_name), !is.na(date)) %>%
     distinct(fg_playerid, date, .keep_all = TRUE)
 
-  out_path <- file.path(RAW_DIR, sprintf("pitcher_gamelogs_%d.csv", year))
   write_csv(out, out_path)
   log_msg("  wrote %s (%d rows)", out_path, nrow(out))
 }

@@ -12,9 +12,14 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2020:2025
+YEARS <- 2020:current_season()
 
 for (year in YEARS) {
+  out_path <- file.path(RAW_DIR, sprintf("fg_team_batting_%d.csv", year))
+  if (skip_completed_season(year, out_path)) {
+    log_msg("=== %d: finished season already collected, skipping ===", year)
+    next
+  }
   log_msg("=== %d: fetching FanGraphs team batting ===", year)
 
   df <- tryCatch(
@@ -53,7 +58,6 @@ for (year in YEARS) {
     log_msg("  WARNING: %d rows dropped due to unmapped team name", n_unmapped)
   }
 
-  out_path <- file.path(RAW_DIR, sprintf("fg_team_batting_%d.csv", year))
   write_csv(out, out_path)
   log_msg("  wrote %s (%d rows)", out_path, nrow(out))
 }

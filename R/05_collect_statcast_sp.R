@@ -24,7 +24,7 @@ source("R/utils.R")
 
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
-YEARS <- 2020:2025
+YEARS <- 2020:current_season()
 BATCH_SIZE <- 20
 MIN_IP_FOR_SP <- 50
 
@@ -76,6 +76,11 @@ fetch_statcast_batch <- function(pitcher_ids, year) {
 }
 
 for (year in YEARS) {
+  out_path <- file.path(RAW_DIR, sprintf("statcast_sp_%d.csv", year))
+  if (skip_completed_season(year, out_path)) {
+    log_msg("=== %d: finished season already collected, skipping ===", year)
+    next
+  }
   log_msg("=== %d: pitcher-level Statcast for SPs ===", year)
 
   starters <- get_starter_ids_for_year(year)
@@ -184,7 +189,6 @@ for (year in YEARS) {
     ) %>%
     distinct(pitcher_name, year, .keep_all = TRUE)
 
-  out_path <- file.path(RAW_DIR, sprintf("statcast_sp_%d.csv", year))
   write_csv(out, out_path)
   log_msg("  wrote %s (%d rows, min %d IP)", out_path, nrow(out), MIN_IP_FOR_SP)
 }
