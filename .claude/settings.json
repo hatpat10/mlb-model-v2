@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tasklist *)",
+      "Bash(where *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(sed -n 's/.*\"file_path\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | tr '\\' '/' | tr -s '/'); case \"$f\" in */scripts/*.py|*/features/builder.py) o=$(venv/Scripts/python.exe .claude/skills/run-mlb-model-v2/smoke.py 2>&1); c=$?; if [ \"$c\" -ne 0 ]; then printf 'Smoke test FAILED after editing %s (exit %s):\\n' \"$f\" \"$c\"; printf '%s\\n' \"$o\" | tail -25; exit 2; fi;; esac; exit 0",
+            "shell": "bash",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 120,
+            "statusMessage": "Smoke-testing pipeline after edit",
+            "rewakeSummary": "Smoke test failed after your edit"
+          }
+        ]
+      }
+    ]
+  }
+}
