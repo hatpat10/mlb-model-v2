@@ -1,0 +1,4 @@
+date,game_pk,home_team,away_team,home_team_name,away_team_name,commence_time_utc,snapshot_time_utc,n_books,home_ml_close,away_ml_close,home_no_vig_prob
+2026-07-22,822873,TEX,CWS,Texas Rangers,Chicago White Sox,2026-07-23T00:05:00+00:00,2026-07-22T23:19:47.943605+00:00,9,107,-117,0.47257126679587974
+2026-07-22,824650,CHC,DET,Chicago Cubs,Detroit Tigers,2026-07-23T00:10:00+00:00,2026-07-22T23:19:47.943605+00:00,9,-125,105,0.5324675324675325
+2026-07-22,824166,HOU,MIA,Houston Astros,Miami Marlins,2026-07-23T00:10:00+00:00,2026-07-22T23:19:47.943605+00:00,9,-113,-104,0.5099548712503319
