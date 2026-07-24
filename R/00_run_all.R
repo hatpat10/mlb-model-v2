@@ -23,7 +23,8 @@ SCRIPTS <- c(
   "R/10_collect_batter_stats.R",
   "R/11_collect_pitcher_gamelogs.R",
   "R/12_collect_lineups.R",
-  "R/13_collect_player_bio.R"
+  "R/13_collect_player_bio.R",
+  "R/14_collect_boxscores.R"
 )
 
 CUR <- current_season()
@@ -40,7 +41,12 @@ OUTPUT_GLOBS <- list(
   "R/10_collect_batter_stats.R" = sprintf("batter_stats_%d.csv", 2020:CUR),
   "R/11_collect_pitcher_gamelogs.R" = sprintf("pitcher_gamelogs_%d.csv", 2020:CUR),
   "R/12_collect_lineups.R" = sprintf("lineups_%d.csv", 2021:CUR),
-  "R/13_collect_player_bio.R" = c("player_bio.csv")
+  "R/13_collect_player_bio.R" = c("player_bio.csv"),
+  "R/14_collect_boxscores.R" = c(
+    sprintf("batter_gamelogs_%d.csv", 2021:CUR),
+    sprintf("pitcher_boxscore_%d.csv", 2021:CUR),
+    sprintf("team_boxscore_%d.csv", 2021:CUR)
+  )
 )
 
 RAW_DIR <- "data/raw"
@@ -90,7 +96,7 @@ if (n_core_success < 4) {
   log_msg("Do not proceed to feature engineering until this is investigated.")
 }
 n_enhancement_success <- n_success - n_core_success
-log_msg("Enhancement scripts (08-13, player IDs/fielding/batters/pitcher logs/lineups/bio): %d/%d succeeded",
+log_msg("Enhancement scripts (08-14, player IDs/fielding/batters/pitcher logs/lineups/bio/boxscores): %d/%d succeeded",
         n_enhancement_success, length(SCRIPTS) - length(CORE_SCRIPTS))
 
 log_msg("========== R data collection: done ==========")
