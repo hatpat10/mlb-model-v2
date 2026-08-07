@@ -1,13 +1,47 @@
 # -*- coding: utf-8 -*-
-"""Shared odds math for scripts/04_predict.py and
-scripts/07_capture_closing_lines.py. Both need the identical
-per-book-de-vig-then-median aggregation so that the "edge" computed at
-prediction time and the "closing line" stored for CLV are on exactly the
-same scale — keeping this in one module is what guarantees that.
+"""Shared odds math + schedule lookup for scripts/04_predict.py,
+scripts/06_runner.py and scripts/07_capture_closing_lines.py. The odds math
+needs to be identical (per-book-de-vig-then-median aggregation) so the
+"edge" computed at prediction time and the "closing line" stored for CLV
+are on exactly the same scale; `fetch_slate` is shared so every caller
+gets game start times from the one MLB Stats API call shape.
 """
 import numpy as np
+import pandas as pd
+import requests
+from datetime import datetime
+
+from features import builder
 
 MIN_BOOKMAKERS = 3
+MLB_API = "https://statsapi.mlb.com/api/v1"
+
+
+def fetch_slate(date: str) -> pd.DataFrame:
+    """A day's regular-season games from the MLB Stats API: game_pk, team
+    names + normalized abbreviations, and first-pitch time (UTC)."""
+    resp = requests.get(f"{MLB_API}/schedule", params={"sportId": 1, "date": date, "hydrate": "team"}, timeout=30)
+    resp.raise_for_status()
+    rows = []
+    for date_entry in resp.json().get("dates", []):
+        for g in date_entry.get("games", []):
+            if g.get("gameType") != "R":
+                continue
+            home = g["teams"]["home"]["team"]
+            away = g["teams"]["away"]["team"]
+            rows.append({
+                "game_pk": str(g["gamePk"]),
+                "home_team_name": home.get("name"),
+                "away_team_name": away.get("name"),
+                "home_team": home.get("abbreviation"),
+                "away_team": away.get("abbreviation"),
+                "start_utc": datetime.fromisoformat(g["gameDate"].replace("Z", "+00:00")),
+            })
+    slate = pd.DataFrame(rows)
+    if not slate.empty:
+        slate["home_team"] = builder.normalize_team_abbrev(slate["home_team"])
+        slate["away_team"] = builder.normalize_team_abbrev(slate["away_team"])
+    return slate
 
 
 def american_to_implied_prob(odds):
