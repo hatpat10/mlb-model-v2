@@ -15,7 +15,11 @@ import pandas as pd
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config.config import LEAGUE_AVG_SP, STADIUM_COORDS, TEAM_ABBREV_MAP  # noqa: E402
+from config.config import LEAGUE_AVG_SP, STADIUM_COORDS, TEAM_ABBREV_MAP, TRAIN_YEARS  # noqa: E402
+
+# Umpire starts needed (strictly before a given game) before umpire_run_factor is
+# trusted rather than left NaN — mirrors the R collector's old MIN_GAMES_FOR_FACTOR.
+MIN_UMPIRE_GAMES_FOR_FACTOR = 10
 
 # Per-team features that need both a home_ and away_ prefixed copy when the
 # long (team-per-game) table is pivoted to one row per game. Shared by
@@ -436,6 +440,16 @@ def join_pitcher_rolling_form(df: pd.DataFrame, pitcher_gamelogs: pd.DataFrame) 
 def join_park_factors(df: pd.DataFrame, park_factors: pd.DataFrame) -> pd.DataFrame:
     """park_factor (and park_factor_h, if available) for the game's host
     (home) team. Host is `team` when is_home==1, else `opponent`.
+
+    R/06_collect_park_factors.R computes each team-season's factor from that
+    *entire* season's home/road run totals — legitimate once the season is
+    over, but joining it back onto games from that same season (the old
+    behavior) let an April game see a factor partly built from September
+    data. Lagging the join by one year fixes that: a game in year Y gets
+    year Y-1's factor, which was fully known before Y's first pitch. The
+    first collected year (2021) has no prior-year data and gets NaN, same
+    as any other missing feature (falls through to coverage_check /
+    train-median imputation).
     """
     pf = park_factors.copy()
     pf["team"] = normalize_team_abbrev(pf["team"])
@@ -445,6 +459,7 @@ def join_park_factors(df: pd.DataFrame, park_factors: pd.DataFrame) -> pd.DataFr
     else:
         logger.warning("park_factor_h not present in park_factors data (fg_park scrape unavailable) — omitted.")
     pf = pf[keep_cols].drop_duplicates(subset=["team", "year"])
+    pf["year"] = pf["year"] + 1  # this team-season's factor applies to games the *following* year
 
     df = df.copy()
     df["_host_team"] = np.where(df["is_home"] == 1, df["team"], df["opponent"])
@@ -452,15 +467,70 @@ def join_park_factors(df: pd.DataFrame, park_factors: pd.DataFrame) -> pd.DataFr
     return df.drop(columns=["_host_team"])
 
 
-def join_umpires(df: pd.DataFrame, umpire_factors: pd.DataFrame) -> pd.DataFrame:
-    """Join umpire_run_factor per game via a (game_pk -> umpire_run_factor)
-    lookup table (already merged from umpire_assignments + umpire_factors).
+def join_umpires(df: pd.DataFrame, umpire_assignments: pd.DataFrame, umpire_game_log: pd.DataFrame) -> pd.DataFrame:
+    """umpire_run_factor: the game's assigned home-plate umpire's average run
+    environment (that umpire's average total runs minus a TRAIN_YEARS-only
+    league baseline), computed using only that umpire's OTHER games strictly
+    before this one — never a later game, including a later season.
+
+    Two-tier lookup, not a single date-based asof match: for an
+    already-played game (its game_pk is present in `umpire_game_log`) this
+    is a direct, unambiguous lookup, since `umpire_game_log`'s own
+    `umpire_run_factor` per row already excludes that row's own outcome via
+    `shift(1)` before the expanding mean. Only a live/future game (game_pk
+    not yet in `umpire_game_log`, since it hasn't been played) falls back to
+    a date-based `merge_asof` for that umpire's most recent known value.
+    (Deliberately not mirroring join_pitcher_rolling_form's single
+    shift+asof-with-allow_exact_matches=False pattern here: for an
+    already-played game that pattern excludes the umpire's true most recent
+    prior start an extra time — once via the internal shift, again via the
+    asof exact-match exclusion — making the joined value one start staler
+    than intended.)
     """
-    uf = umpire_factors[["game_pk", "umpire_run_factor"]].drop_duplicates(subset=["game_pk"])
-    uf["game_pk"] = uf["game_pk"].astype(str)
+    ua = (umpire_assignments[["game_pk", "umpire_name"]]
+          .dropna(subset=["umpire_name"]))
+    ua = ua.assign(game_pk=ua["game_pk"].astype(str)).drop_duplicates(subset=["game_pk"])
+
     df = df.copy()
     df["game_pk"] = df["game_pk"].astype(str)
-    return df.merge(uf, on="game_pk", how="left")
+    df = df.merge(ua, on="game_pk", how="left")
+
+    ug = umpire_game_log.dropna(subset=["umpire_name", "total_runs"]).copy()
+    ug["game_pk"] = ug["game_pk"].astype(str)
+    ug["date"] = pd.to_datetime(ug["date"])
+    ug = ug.sort_values(["umpire_name", "date"])
+
+    train_mask = ug["date"].dt.year.isin(TRAIN_YEARS)
+    league_avg_runs = ug.loc[train_mask, "total_runs"].mean()
+
+    g = ug.groupby("umpire_name", group_keys=False)
+    shifted = g["total_runs"].shift(1)
+    ug["cum_avg_runs"] = shifted.groupby(ug["umpire_name"]).transform(
+        lambda s: s.expanding(min_periods=MIN_UMPIRE_GAMES_FOR_FACTOR).mean())
+    ug["umpire_run_factor"] = ug["cum_avg_runs"] - league_avg_runs
+
+    # Tier 1: exact game_pk match (already-played games).
+    by_game = (ug[["game_pk", "umpire_run_factor"]]
+               .dropna(subset=["umpire_run_factor"])
+               .drop_duplicates(subset=["game_pk"]))
+    df = df.merge(by_game, on="game_pk", how="left")
+
+    # Tier 2: live/future games not yet in umpire_game_log.
+    missing = df["umpire_run_factor"].isna() & df["umpire_name"].notna()
+    if missing.any():
+        history = (ug[["umpire_name", "date", "umpire_run_factor"]]
+                   .dropna(subset=["umpire_run_factor", "date"])
+                   .sort_values("date"))
+        lookup = df.loc[missing, ["umpire_name"]].copy()
+        lookup["_date_dt"] = pd.to_datetime(df.loc[missing, "date"])
+        matched = pd.merge_asof(
+            lookup.reset_index().sort_values("_date_dt"),
+            history, left_on="_date_dt", right_on="date", by="umpire_name",
+            direction="backward", allow_exact_matches=True,
+        ).set_index("index")
+        df.loc[missing, "umpire_run_factor"] = matched["umpire_run_factor"]
+
+    return df.drop(columns=["umpire_name"])
 
 
 def pivot_to_game_level(df: pd.DataFrame) -> pd.DataFrame:

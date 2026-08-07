@@ -286,20 +286,25 @@ def main():
     if park_factors_path.exists():
         df = builder.join_park_factors(df, pd.read_csv(park_factors_path))
 
-    # umpire_run_factor: today's live assignments (if posted yet) mapped
-    # through the same historical umpire_factors table used in training.
-    # Unassigned games stay NaN and fall back to train-set medians below,
-    # same as any other missing feature.
-    factors_path = RAW / "umpire_factors.csv"
-    if factors_path.exists() and not today_umps.empty:
-        factors = pd.read_csv(factors_path)
-        ump_lookup = today_umps.merge(factors[["umpire_name", "umpire_run_factor"]], on="umpire_name", how="left")
-        n_known = ump_lookup["umpire_run_factor"].notna().sum()
-        logger.info(f"Umpire run factors resolved for {n_known}/{len(ump_lookup)} assigned games.")
-        df = builder.join_umpires(df, ump_lookup)
+    # umpire_run_factor: today's live umpire assignment (if posted yet) plus
+    # the full historical assignment/run-log tables, run through the same
+    # join_umpires() used in training — see that function's docstring for
+    # why each game's factor only ever sees that umpire's starts strictly
+    # before it. Unassigned games stay NaN and fall back to train-set
+    # medians below, same as any other missing feature.
+    ump_assign_path = RAW / "umpire_assignments.csv"
+    ump_game_log_path = RAW / "umpire_game_log.csv"
+    if ump_assign_path.exists() and ump_game_log_path.exists() and not today_umps.empty:
+        historical_assignments = pd.read_csv(ump_assign_path)
+        all_assignments = pd.concat([historical_assignments, today_umps], ignore_index=True)
+        umpire_game_log = pd.read_csv(ump_game_log_path)
+        df = builder.join_umpires(df, all_assignments, umpire_game_log)
+        today_known = df.loc[df["date"].astype(str) == date, "umpire_run_factor"]
+        logger.info(f"Umpire run factors resolved for {today_known.notna().sum()}/{len(today_known)} of today's rows.")
     else:
-        if not factors_path.exists():
-            logger.warning("umpire_factors.csv not found — umpire_run_factor left NaN (train-median fallback).")
+        if not (ump_assign_path.exists() and ump_game_log_path.exists()):
+            logger.warning("umpire_assignments.csv/umpire_game_log.csv not found — umpire_run_factor left NaN "
+                            "(train-median fallback).")
         df["umpire_run_factor"] = df.get("umpire_run_factor", np.nan)
 
     today_mask = df["date"].astype(str) == date

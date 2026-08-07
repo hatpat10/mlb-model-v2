@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Home-plate umpire assignments and career run-scoring tendencies.
+# Home-plate umpire assignments and per-game run environment.
 #
 # Retrosheet event files (baseballr::get_retrosheet_data / retrosheet_data)
 # require the external Chadwick CLI tool, which isn't installed on this
@@ -8,6 +8,16 @@
 # every call to mlb_probables(game_pk) returns home_plate_full_name /
 # home_plate_id alongside the probable starters, so umpire assignments come
 # for free from data already collected — no extra API calls needed.
+#
+# This script deliberately does NOT aggregate umpires into a career-average
+# "run factor" here (that used to happen in this file, but collapsing all
+# years 2021-2026 into one lifetime average and joining it back onto every
+# game — including games years before an umpire's later seasons — is a
+# lookahead bug). Instead it writes the raw per-game (date, umpire, runs)
+# table; features/builder.py:join_umpires computes each game's factor from
+# only that umpire's starts strictly *before* the game date (same
+# shift+expanding pattern as join_pitcher_rolling_form), so the temporal
+# logic lives in one place (features/builder.py) shared by train + predict.
 
 library(dplyr)
 library(readr)
@@ -17,7 +27,6 @@ source("R/utils.R")
 RAW_DIR <- "data/raw"
 dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
 YEARS <- 2021:current_season()
-MIN_GAMES_FOR_FACTOR <- 10
 
 assignments_all <- list()
 runs_all <- list()
@@ -65,19 +74,9 @@ if (length(assignments_all) == 0) {
 
   if (length(runs_all) > 0) {
     runs <- bind_rows(runs_all)
-    league_avg_runs <- mean(runs$total_runs, na.rm = TRUE)
-
-    factors <- runs %>%
-      group_by(umpire_name) %>%
-      summarise(games = n(), avg_total_runs = mean(total_runs, na.rm = TRUE), .groups = "drop") %>%
-      filter(games >= MIN_GAMES_FOR_FACTOR) %>%
-      mutate(umpire_run_factor = round(avg_total_runs - league_avg_runs, 3)) %>%
-      select(umpire_name, games, avg_total_runs, umpire_run_factor)
-
-    write_csv(factors, file.path(RAW_DIR, "umpire_factors.csv"))
-    log_msg("wrote umpire_factors.csv (%d umpires, min %d games, league avg runs/game = %.2f)",
-            nrow(factors), MIN_GAMES_FOR_FACTOR, league_avg_runs)
+    write_csv(runs, file.path(RAW_DIR, "umpire_game_log.csv"))
+    log_msg("wrote umpire_game_log.csv (%d umpired games with known run totals)", nrow(runs))
   } else {
-    log_msg("WARNING: no game log data joined, umpire_factors.csv not written")
+    log_msg("WARNING: no game log data joined, umpire_game_log.csv not written")
   }
 }

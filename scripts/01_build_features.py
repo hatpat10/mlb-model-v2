@@ -71,15 +71,13 @@ def main():
         columns=["team", "year", "park_factor"])
 
     umpire_assign_path = RAW / "umpire_assignments.csv"
-    umpire_factors_path = RAW / "umpire_factors.csv"
-    if umpire_assign_path.exists() and umpire_factors_path.exists():
-        assign = pd.read_csv(umpire_assign_path)
-        factors = pd.read_csv(umpire_factors_path)
-        umpire_lookup = assign.merge(factors[["umpire_name", "umpire_run_factor"]], on="umpire_name", how="left")
-        umpire_lookup["game_pk"] = umpire_lookup["game_pk"].astype(str)
-    else:
-        logger.warning("umpire assignment/factor files not found — umpire_run_factor will be all-NaN")
-        umpire_lookup = pd.DataFrame(columns=["game_pk", "umpire_run_factor"])
+    umpire_game_log_path = RAW / "umpire_game_log.csv"
+    umpire_assignments = pd.read_csv(umpire_assign_path) if umpire_assign_path.exists() else pd.DataFrame(
+        columns=["date", "game_pk", "umpire_name"])
+    umpire_game_log = pd.read_csv(umpire_game_log_path) if umpire_game_log_path.exists() else pd.DataFrame(
+        columns=["date", "game_pk", "umpire_name", "total_runs"])
+    if umpire_assignments.empty or umpire_game_log.empty:
+        logger.warning("umpire_assignments/umpire_game_log not found or empty — umpire_run_factor will be all-NaN")
 
     logger.info("Building features via features/builder.py ...")
     df = builder.build_rolling_features(game_logs)
@@ -127,8 +125,8 @@ def main():
     else:
         logger.warning("park_factors data unavailable — skipping join_park_factors")
 
-    if not umpire_lookup.empty:
-        df = builder.join_umpires(df, umpire_lookup)
+    if not umpire_assignments.empty and not umpire_game_log.empty:
+        df = builder.join_umpires(df, umpire_assignments, umpire_game_log)
     else:
         df["umpire_run_factor"] = np.nan
 
