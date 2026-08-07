@@ -23,10 +23,13 @@ Usage:
   python scripts/07_capture_closing_lines.py --date YYYY-MM-DD
   python scripts/07_capture_closing_lines.py --once          # single snapshot now, then exit
   python scripts/07_capture_closing_lines.py --pregame-predict
-      # additionally, 2 hours before the day's first pitch, re-run
-      # 04_predict.py + 05_bankroll.py --log-bets so bets are logged with
-      # posted lineups/umpires and near-final lines (the 8 AM run's
-      # already-logged games are skipped by 05_bankroll's dupe guard).
+      # additionally, 2 hours before EACH distinct start time (not just the
+      # day's first game), re-run 04_predict.py + 05_bankroll.py --log-bets
+      # so bets are logged with posted lineups/umpires and near-final lines
+      # (the 8 AM run's already-logged games are skipped by 05_bankroll's
+      # dupe guard). Bets are only logged if 04_predict.py exits
+      # successfully AND writes a fresh predictions_<date>.csv this
+      # invocation — a failed/stale predict never reaches bankroll logging.
 """
 import sys
 import os
@@ -50,6 +53,7 @@ from odds_utils import aggregate_h2h_event, fetch_slate, MIN_BOOKMAKERS  # noqa:
 
 RAW = PATHS["raw"]
 LOGS = PATHS["logs"]
+OUTPUTS = PATHS["outputs"]
 ROOT = PATHS["root"]
 PYTHON = ROOT / "venv" / "Scripts" / "python.exe"
 
@@ -164,8 +168,31 @@ def write_snapshot(date: str, slate: pd.DataFrame, matched: dict, now_utc: datet
 
 
 def run_pregame_predict(date: str):
+    """Re-run 04_predict.py, and only proceed to bankroll bet-logging if it
+    actually succeeded and produced a FRESH predictions_<date>.csv this
+    invocation. Without this gate, a failed or hung predict (check=False,
+    previously) let bankroll logging silently consume an older prediction
+    file from an earlier run — a valid-looking ledger entry for a decision
+    this run never made.
+    """
     logger.info("Running pre-first-pitch re-predict (posted lineups/umps + near-final lines) ...")
-    subprocess.run([str(PYTHON), "scripts/04_predict.py", "--date", date], cwd=str(ROOT), check=False)
+    invoked_at = datetime.now(timezone.utc)
+    result = subprocess.run([str(PYTHON), "scripts/04_predict.py", "--date", date], cwd=str(ROOT))
+    if result.returncode != 0:
+        logger.error(f"04_predict.py exited {result.returncode} — skipping bet-logging to avoid "
+                      "staking on a stale/missing prediction.")
+        return
+
+    pred_path = OUTPUTS / f"predictions_{date}.csv"
+    if not pred_path.exists():
+        logger.error(f"{pred_path.name} does not exist after a successful predict run — skipping bet-logging.")
+        return
+    written_at = datetime.fromtimestamp(pred_path.stat().st_mtime, tz=timezone.utc)
+    if written_at < invoked_at:
+        logger.error(f"{pred_path.name} was not refreshed by this run (last written {written_at:%H:%M UTC}, "
+                      f"before this invocation started at {invoked_at:%H:%M UTC}) — skipping bet-logging.")
+        return
+
     subprocess.run([str(PYTHON), "scripts/05_bankroll.py", "--date", date, "--log-bets"], cwd=str(ROOT), check=False)
 
 
@@ -221,13 +248,19 @@ def main():
             logger.warning(f"Start time {start:%H:%M UTC} already within {SNAPSHOT_LEAD} — "
                            f"baseline snapshot will serve as its closing line.")
     if args.pregame_predict:
-        first_pitch = pd.Timestamp(slate["start_utc"].min()).to_pydatetime()
-        predict_at = first_pitch - PREGAME_PREDICT_LEAD
-        if predict_at > now:
-            wakes.append((predict_at, "predict"))
-        else:
-            logger.warning("First pitch is less than 2h away — skipping the pre-game re-predict wake "
-                           "(run scripts/04_predict.py manually if wanted).")
+        # One predict wake per distinct start time (not just the day's first
+        # game) — a single wake off the earliest game left every later
+        # start-time cluster on a multi-wave slate betting on stale/fallback
+        # lineup data (~92% lineup-fallback observed on a 2026-07-27 slate
+        # with several distinct start times).
+        for start in sorted(slate["start_utc"].unique()):
+            start = pd.Timestamp(start).to_pydatetime()
+            predict_at = start - PREGAME_PREDICT_LEAD
+            if predict_at > now:
+                wakes.append((predict_at, "predict"))
+            else:
+                logger.warning(f"Start time {start:%H:%M UTC} is less than {PREGAME_PREDICT_LEAD} away — "
+                               "skipping its pre-game re-predict wake.")
     wakes.sort(key=lambda w: w[0])
 
     snapshot("baseline")
