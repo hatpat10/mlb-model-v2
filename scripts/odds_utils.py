@@ -55,6 +55,17 @@ def american_to_implied_prob(odds):
         return np.where(odds < 0, -odds / (-odds + 100), 100 / (odds + 100))
 
 
+def american_to_decimal_odds(odds):
+    """American price -> decimal payout multiplier (stake included), e.g.
+    +150 -> 2.50, -120 -> 1.8333. Used for pricing actual bet payouts —
+    never for computing an edge, where the de-vigged fair PROBABILITY
+    (american_to_implied_prob, then no-vigged) is the correct comparison.
+    """
+    odds = np.asarray(odds, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(odds < 0, 1 + 100 / -odds, 1 + odds / 100)
+
+
 def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
     """Collapse one The-Odds-API event's h2h books into a market consensus.
 

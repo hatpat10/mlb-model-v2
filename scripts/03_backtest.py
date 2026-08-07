@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config.config import PATHS, TEST_YEAR, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE  # noqa: E402
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
+from odds_utils import american_to_decimal_odds  # noqa: E402
 
 RAW = PATHS["raw"]
 PROCESSED = PATHS["processed"]
@@ -69,21 +70,32 @@ def load_real_closing_lines():
     return odds
 
 
-def moneyline_roi(test_df, home_market_prob, label):
-    """Bets whenever |model_prob - market_prob| is within
+def moneyline_roi(test_df, home_fair_prob, label, home_ml_close=None, away_ml_close=None):
+    """Bets whenever |model_prob - home_fair_prob| is within
     [MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE) — MAX is a hard cap: an edge
     that large against the market is far more likely a data/model bug than
-    a real inefficiency, so those games are skipped, not bet.
+    a real inefficiency, so those games are skipped, not bet. `home_fair_prob`
+    (the de-vigged fair probability) is only ever used to size the EDGE —
+    for real closing lines, payout is priced off the actual quoted
+    home_ml_close/away_ml_close via american_to_decimal_odds, since pricing
+    payout off the fair probability instead (1/home_fair_prob) silently
+    strips out the sportsbook's margin and overstates ROI. The synthetic
+    Elo-proxy path has no real quoted price, so it has no choice but to
+    price off the fair probability too — already disclaimed at the call site.
     """
-    edge = test_df["model_home_prob"].values - home_market_prob
+    edge = test_df["model_home_prob"].values - home_fair_prob
     bet_home = (edge >= MIN_EDGE_MONEYLINE) & (edge < MAX_EDGE_MONEYLINE)
     bet_away = (-edge >= MIN_EDGE_MONEYLINE) & (-edge < MAX_EDGE_MONEYLINE)
 
     home_win = test_df["home_win"].values
     pnl = np.zeros(len(test_df))
 
-    home_decimal_odds = np.divide(1.0, home_market_prob, out=np.full_like(home_market_prob, np.nan), where=home_market_prob > 0)
-    away_decimal_odds = np.divide(1.0, (1 - home_market_prob), out=np.full_like(home_market_prob, np.nan), where=(1 - home_market_prob) > 0)
+    if home_ml_close is not None and away_ml_close is not None:
+        home_decimal_odds = american_to_decimal_odds(home_ml_close)
+        away_decimal_odds = american_to_decimal_odds(away_ml_close)
+    else:
+        home_decimal_odds = np.divide(1.0, home_fair_prob, out=np.full_like(home_fair_prob, np.nan), where=home_fair_prob > 0)
+        away_decimal_odds = np.divide(1.0, (1 - home_fair_prob), out=np.full_like(home_fair_prob, np.nan), where=(1 - home_fair_prob) > 0)
 
     pnl[bet_home & (home_win == 1)] = (home_decimal_odds - 1)[bet_home & (home_win == 1)]
     pnl[bet_home & (home_win == 0)] = -1
@@ -115,7 +127,10 @@ def main():
         merged = test_df.merge(real_odds, on="game_pk", how="inner")
         logger.info(f"Found REAL closing-line data for {len(merged)}/{len(test_df)} holdout games.")
         if len(merged) > 0:
-            results["roi_real"] = moneyline_roi(merged, merged["home_no_vig_prob"].values, label="REAL")
+            results["roi_real"] = moneyline_roi(
+                merged, merged["home_no_vig_prob"].values, label="REAL",
+                home_ml_close=merged["home_ml_close"].values, away_ml_close=merged["away_ml_close"].values,
+            )
         else:
             logger.warning("No holdout games matched real closing-line data by game_pk.")
     else:
@@ -126,6 +141,11 @@ def main():
         )
         synthetic_prob = test_df["elo_win_prob"].fillna(0.5).values
         results["roi_synthetic"] = moneyline_roi(test_df, synthetic_prob, label="SYNTHETIC (Elo-implied)")
+
+    # False until a real-price backtest has actually run with enough bets to
+    # mean anything — never true from the synthetic Elo-proxy path, and not
+    # true just because a real-price run happened to place zero bets.
+    results["strategy_validated"] = bool(results.get("roi_real", {}).get("n_bets", 0) > 0)
 
     out_path = OUTPUTS / f"backtest_{TEST_YEAR}.json"
     with open(out_path, "w") as f:
