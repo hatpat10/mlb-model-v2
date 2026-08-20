@@ -49,7 +49,7 @@ def build():
         "data source (or one engineered-feature group) and lists the stats it provides, what they "
         "mean, and their scale. Team and starting-pitcher season stats are collected back to 2020, "
         "batter/fielding/lineup data back to 2021 — the search app built on top of this data is "
-        "currently scoped to the 2026 season only."
+        "automatically scoped to the current season."
     )
 
     doc.add_page_break()

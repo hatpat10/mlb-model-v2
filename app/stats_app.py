@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Search app: look up a 2026 team or player and see every stat that matters
-for it in one place. Pulls straight from data/raw/*_2026.csv and the trained
+"""Search app: look up a current-season team or player and see every stat
+that matters. Pulls straight from the current data/raw season files and the trained
 model's feature_matrix.csv — nothing here is recomputed independently of the
 pipeline, so what you see here matches what 04_predict.py sees.
 
@@ -9,6 +9,7 @@ Run:
 """
 import difflib
 import sys
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -21,7 +22,7 @@ from config.config import PATHS, TEAM_ABBREVS  # noqa: E402
 
 RAW = PATHS["raw"]
 PROC = PATHS["processed"]
-SEASON = 2026
+SEASON = date.today().year
 LABELS = stat_lookup()
 
 TEAM_FULL_NAMES = {
@@ -185,7 +186,7 @@ def show_team(abbr: str):
             ("bb_pct", tb_row["bb_pct"], "{:.1%}"), ("k_pct", tb_row["k_pct"], "{:.1%}"),
         ])
     else:
-        st.caption("No team batting data yet for 2026.")
+        st.caption(f"No team batting data yet for {SEASON}.")
     if sct_row is not None:
         c1, c2, c3, c4 = st.columns(4)
         metric(c1, "barrel_pct", sct_row["barrel_pct"], "{:.1%}")
@@ -202,7 +203,7 @@ def show_team(abbr: str):
         metric(c2, "oaa", tf_row["oaa"], "{:.0f}")
         metric(c3, "def_runs", tf_row["def_runs"], "{:.1f}")
     else:
-        st.caption("No team fielding data yet for 2026.")
+        st.caption(f"No team fielding data yet for {SEASON}.")
 
     pf = DATA["park_factors"]
     pf_row = pf[pf["team"] == abbr] if not pf.empty else pd.DataFrame()
@@ -220,7 +221,7 @@ def show_team(abbr: str):
         cols = [c for c in cols if c in merged.columns]
         st.dataframe(merged[cols].sort_values("ip", ascending=False).reset_index(drop=True), use_container_width=True)
     else:
-        st.caption("No starting-pitcher data yet for 2026.")
+        st.caption(f"No starting-pitcher data yet for {SEASON}.")
 
     st.subheader("Recent Games")
     if len(team_games):
@@ -328,7 +329,7 @@ def show_player(name: str):
         )
 
     if not is_pitcher and not len(bs_row):
-        st.info("Found this player's name but no 2026 stat line yet (insufficient PA/GS, or data hasn't been collected for them).")
+        st.info(f"Found this player's name but no {SEASON} stat line yet (insufficient PA/GS, or data hasn't been collected for them).")
 
 
 # --------------------------------------------------------------------------

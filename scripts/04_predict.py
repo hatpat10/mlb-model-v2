@@ -12,7 +12,7 @@ import json
 import argparse
 import unicodedata
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -25,12 +25,19 @@ import os
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config.config import PATHS, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE, TEAM_ABBREV_MAP  # noqa: E402
+from config.config import (  # noqa: E402
+    PATHS, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE, TEAM_ABBREV_MAP,
+    REQUIRE_POSTED_LINEUPS_FOR_BET, REQUIRE_UMPIRE_FOR_BET,
+)
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from odds_utils import aggregate_h2h_event  # noqa: E402
+from artifact_utils import atomic_write_csv, make_run_id, sha256_file, utc_now_iso  # noqa: E402
+from model_registry import resolve_production_model_dir  # noqa: E402
 from features import builder  # noqa: E402
+from features.pitcher_utils import filter_verified_starts  # noqa: E402
 
 RAW = PATHS["raw"]
+PROCESSED = PATHS["processed"]
 MODELS = PATHS["models"]
 OUTPUTS = PATHS["outputs"]
 LOGS = PATHS["logs"]
@@ -77,6 +84,7 @@ def fetch_schedule_with_probables(date: str) -> list:
                 "home_starter": strip_accents(home_probable.get("fullName")),
                 "away_starter": strip_accents(away_probable.get("fullName")),
                 "venue_name": g.get("venue", {}).get("name"),
+                "start_utc": g.get("gameDate"),
             })
     return games
 
@@ -135,10 +143,16 @@ def fetch_moneyline_odds() -> pd.DataFrame:
                 .strftime("%Y-%m-%d")
             )
         rows.append({
+            "odds_event_id": event.get("id"),
             "home_team_name": event.get("home_team"), "away_team_name": event.get("away_team"),
             "event_date": event_date,
+            "commence_time_utc": commence,
             "home_ml": agg["home_ml"], "away_ml": agg["away_ml"],
             "no_vig_home_implied": agg["no_vig_home_implied"],
+            "n_books": agg["n_books"],
+            "bookmaker_key": agg.get("bookmaker_key"),
+            "bookmaker_title": agg.get("bookmaker_title"),
+            "bookmaker_last_update": agg.get("bookmaker_last_update"),
         })
     return pd.DataFrame(rows)
 
@@ -188,6 +202,8 @@ def main():
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
     args = parser.parse_args()
     date = args.date
+    run_id = make_run_id("predict")
+    generated_at_utc = utc_now_iso()
 
     load_dotenv(PATHS["root"] / ".env")
 
@@ -280,6 +296,7 @@ def main():
     if not player_bio.empty and not lineups.empty:
         df = builder.join_player_bio(df, player_bio, lineups)
     if not pitcher_gamelogs.empty:
+        pitcher_gamelogs = filter_verified_starts(pitcher_gamelogs, combined)
         df = builder.join_pitcher_rolling_form(df, pitcher_gamelogs)
 
     park_factors_path = RAW / "park_factors.csv"
@@ -310,11 +327,24 @@ def main():
     today_mask = df["date"].astype(str) == date
     today_long = df[today_mask].copy()
 
-    with open(MODELS / "feature_names.json") as f:
+    production_dir = resolve_production_model_dir(MODELS)
+    model_dir = production_dir or MODELS
+    if model_dir == MODELS:
+        logger.warning("No complete production/current model bundle found; using frozen benchmark artifacts.")
+    model_manifest = {}
+    if (model_dir / "manifest.json").exists():
+        with open(model_dir / "manifest.json", encoding="utf-8") as handle:
+            model_manifest = json.load(handle)
+    live_feature_manifest = {}
+    if (PROCESSED / "feature_manifest.json").exists():
+        with open(PROCESSED / "feature_manifest.json", encoding="utf-8") as handle:
+            live_feature_manifest = json.load(handle)
+
+    with open(model_dir / "feature_names.json") as f:
         features = json.load(f)["passing_features"]
-    medians = joblib.load(MODELS / "train_medians.joblib")
-    xgb_cal = joblib.load(MODELS / "xgb_calibrated.joblib")
-    lgbm_cal = joblib.load(MODELS / "lgbm_calibrated.joblib")
+    medians = joblib.load(model_dir / "train_medians.joblib")
+    xgb_cal = joblib.load(model_dir / "xgb_calibrated.joblib")
+    lgbm_cal = joblib.load(model_dir / "lgbm_calibrated.joblib")
 
     game_df, _ = builder.pivot_to_game_level(today_long)
 
@@ -329,7 +359,7 @@ def main():
     # game_df only carries team abbreviations, but the odds feed matches on
     # full team names, so bring those in from the original schedule payload first.
     game_df["game_pk"] = game_df["game_pk"].astype(str)
-    game_meta = pd.DataFrame(games)[["game_pk", "home_team_name", "away_team_name"]]
+    game_meta = pd.DataFrame(games)[["game_pk", "home_team_name", "away_team_name", "venue_name", "start_utc"]]
     game_meta["game_pk"] = game_meta["game_pk"].astype(str)
     game_df = game_df.merge(game_meta, on="game_pk", how="left")
 
@@ -339,13 +369,23 @@ def main():
         # same two teams play on consecutive days, matching on team names
         # alone would fan one game out into multiple rows with mismatched
         # odds attached. Scope to this date's events before merging.
-        odds_today = odds[odds["event_date"] == date].drop(columns=["event_date"])
-        n_before = len(game_df)
-        game_df = game_df.merge(odds_today, on=["home_team_name", "away_team_name"], how="left")
-        if len(game_df) != n_before:
-            logger.warning(f"Odds merge produced {len(game_df)} rows from {n_before} games — "
-                            f"dropping extra matches per game_pk to avoid mismatched odds.")
-            game_df = game_df.drop_duplicates(subset=["game_pk"], keep="first")
+        odds_today = odds[odds["event_date"] == date].copy()
+        candidates = []
+        for odds_idx, event in odds_today.iterrows():
+            matches = game_df[(game_df["home_team_name"] == event["home_team_name"])
+                              & (game_df["away_team_name"] == event["away_team_name"])]
+            event_start = pd.to_datetime(event["commence_time_utc"], utc=True)
+            for _, game in matches.iterrows():
+                game_start = pd.to_datetime(game["start_utc"], utc=True)
+                candidates.append((abs((game_start - event_start).total_seconds()), game["game_pk"], odds_idx))
+        assignments, used_games, used_events = [], set(), set()
+        for _, game_pk, odds_idx in sorted(candidates):
+            if game_pk in used_games or odds_idx in used_events:
+                continue
+            used_games.add(game_pk)
+            used_events.add(odds_idx)
+            assignments.append({"game_pk": game_pk, **odds_today.loc[odds_idx].drop(labels=["event_date", "home_team_name", "away_team_name"]).to_dict()})
+        game_df = game_df.merge(pd.DataFrame(assignments), on="game_pk", how="left") if assignments else game_df
         # no_vig_home_implied already comes from fetch_moneyline_odds() as the
         # median of each book's own no-vig probability — do not recompute it
         # from home_ml/away_ml here, since those are just one representative
@@ -355,9 +395,48 @@ def main():
         game_df["away_ml"] = np.nan
         game_df["no_vig_home_implied"] = np.nan
 
+    lineup_games = set()
+    if not today_lineups.empty:
+        lineup_counts = today_lineups.groupby("game_pk").agg(sides=("is_home", "nunique"), batters=("batter_mlbam_id", "size"))
+        lineup_games = set(lineup_counts[(lineup_counts["sides"] == 2) & (lineup_counts["batters"] >= 18)].index.astype(str))
+    umpire_games = set(today_umps["game_pk"].astype(str)) if not today_umps.empty else set()
+    game_df["lineup_available"] = game_df["game_pk"].isin(lineup_games)
+    game_df["umpire_available"] = game_df["game_pk"].isin(umpire_games)
+    game_df["run_id"] = run_id
+    game_df["generated_at_utc"] = generated_at_utc
+    game_df["model_version"] = model_manifest.get("model_version", f"legacy_{sha256_file(model_dir / 'xgb_calibrated.joblib')[:12]}")
+    game_df["model_mode"] = model_manifest.get("mode", "benchmark_legacy")
+    game_df["data_version"] = live_feature_manifest.get("data_version")
+    game_df["feature_build_id"] = live_feature_manifest.get("build_id")
+    game_df["model_training_data_version"] = model_manifest.get("data_version")
+    game_df["model_feature_build_id"] = model_manifest.get("feature_build_id")
+    game_df["odds_snapshot_utc"] = generated_at_utc
+
+    game_df["starters_confirmed"] = game_df["home_starter"].notna() & game_df["away_starter"].notna()
+    game_df["market_available"] = (
+        game_df["home_ml"].notna() & game_df["away_ml"].notna()
+        & game_df.get("n_books", pd.Series(0, index=game_df.index)).fillna(0).ge(MIN_BOOKMAKERS)
+    )
+    game_df["decision_eligible"] = (
+        game_df["starters_confirmed"] & game_df["market_available"]
+        & game_df["model_mode"].eq("production")
+        & (game_df["lineup_available"] if REQUIRE_POSTED_LINEUPS_FOR_BET else True)
+        & (game_df["umpire_available"] if REQUIRE_UMPIRE_FOR_BET else True)
+    )
+    def ineligibility_reason(row):
+        reasons = []
+        if not row["starters_confirmed"]: reasons.append("probable_starter_missing")
+        if not row["market_available"]: reasons.append("market_missing_or_thin")
+        if row["model_mode"] != "production": reasons.append("production_model_missing")
+        if REQUIRE_POSTED_LINEUPS_FOR_BET and not row["lineup_available"]: reasons.append("lineups_not_posted")
+        if REQUIRE_UMPIRE_FOR_BET and not row["umpire_available"]: reasons.append("umpire_not_posted")
+        return ";".join(reasons)
+    game_df["ineligibility_reason"] = game_df.apply(ineligibility_reason, axis=1)
+
     game_df["edge"] = game_df["home_win_prob"] - game_df["no_vig_home_implied"]
     game_df["bet_flag"] = (
-        game_df["edge"].abs().ge(MIN_EDGE_MONEYLINE) & game_df["edge"].abs().lt(MAX_EDGE_MONEYLINE)
+        game_df["decision_eligible"] & game_df["edge"].abs().ge(MIN_EDGE_MONEYLINE)
+        & game_df["edge"].abs().lt(MAX_EDGE_MONEYLINE)
     )
     game_df["bet_side"] = np.where(game_df["bet_flag"] & (game_df["edge"] > 0), "HOME",
                             np.where(game_df["bet_flag"] & (game_df["edge"] < 0), "AWAY", ""))
@@ -370,7 +449,7 @@ def main():
             f"model_home_win_prob={row['home_win_prob']:.3f}  "
             f"market_no_vig_home={row['no_vig_home_implied']:.3f}  "
             f"edge={row['edge']:+.3f}  "
-            f"{'*** BET ' + row['bet_side'] + ' ***' if row['bet_flag'] else ''}"
+            f"{'*** BET ' + row['bet_side'] + ' ***' if row['bet_flag'] else ('[NO BET: ' + row['ineligibility_reason'] + ']' if not row['decision_eligible'] else '')}"
             if pd.notna(row["no_vig_home_implied"]) else
             f"{row['away_team']} @ {row['home_team']}  |  SP: {row['away_starter']} vs {row['home_starter']}  |  "
             f"model_home_win_prob={row['home_win_prob']:.3f}  (no market odds available)"
@@ -379,9 +458,12 @@ def main():
     OUTPUTS.mkdir(parents=True, exist_ok=True)
     csv_path = OUTPUTS / f"predictions_{date}.csv"
     xlsx_path = OUTPUTS / f"predictions_{date}.xlsx"
-    game_df.to_csv(csv_path, index=False)
+    atomic_write_csv(game_df, csv_path)
     game_df.to_excel(xlsx_path, index=False)
+    history_path = OUTPUTS / "prediction_history" / date / f"{run_id}.csv"
+    atomic_write_csv(game_df, history_path)
     logger.info(f"Saved {csv_path} and {xlsx_path}")
+    logger.info(f"Immutable decision snapshot: {history_path}")
 
 
 if __name__ == "__main__":

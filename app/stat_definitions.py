@@ -165,7 +165,7 @@ SECTIONS = [
     },
     {
         "title": "Umpire Context",
-        "source": "data/raw/umpire_assignments.csv + umpire_factors.csv — MLB Stats API",
+        "source": "data/raw/umpire_assignments.csv + umpire_game_log.csv — MLB Stats API",
         "grain": "One row per game (assignment) / one row per umpire (factor)",
         "stats": [
             ("umpire_name", "Home Plate Umpire", "Umpire assigned behind the plate for the game.", "name"),

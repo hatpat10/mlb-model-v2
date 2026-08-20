@@ -5,6 +5,7 @@ runs coverage_check(), and writes data/processed/feature_matrix.csv +
 data/processed/feature_names.json.
 """
 import sys
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,8 +14,11 @@ import pandas as pd
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config.config import PATHS, ALL_DATA_YEARS  # noqa: E402
+from config.config import PATHS, TRAIN_YEARS, PRODUCTION_TRAIN_YEARS  # noqa: E402
 from features import builder  # noqa: E402
+from features.pitcher_utils import filter_verified_starts  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from artifact_utils import atomic_write_csv, atomic_write_json, make_run_id, sha256_file, utc_now_iso  # noqa: E402
 
 RAW = PATHS["raw"]
 PROCESSED = PATHS["processed"]
@@ -116,6 +120,9 @@ def main():
         logger.warning("player_bio/lineups data unavailable — skipping join_player_bio")
 
     if not pitcher_gamelogs.empty:
+        before = len(pitcher_gamelogs)
+        pitcher_gamelogs = filter_verified_starts(pitcher_gamelogs, game_logs)
+        logger.info(f"Verified starter-only pitcher logs: {len(pitcher_gamelogs)}/{before} appearances retained")
         df = builder.join_pitcher_rolling_form(df, pitcher_gamelogs)
     else:
         logger.warning("pitcher_gamelogs data unavailable — skipping join_pitcher_rolling_form")
@@ -136,18 +143,73 @@ def main():
     game_df, feature_cols = builder.pivot_to_game_level(df)
     logger.info(f"Pivoted game-level table: {len(game_df)} rows, {len(game_df.columns)} columns")
 
-    passing_cols = builder.coverage_check(game_df, feature_cols, min_coverage=0.95,
-                                           train_years=[y for y in ALL_DATA_YEARS if y <= 2025])
+    # Feature eligibility is selected from training seasons only. Looking at
+    # holdout/current-season coverage here would leak deployment availability
+    # into what is nominally an untouched benchmark.
+    passing_cols = builder.coverage_check(
+        game_df, feature_cols, min_coverage=0.95, train_years=TRAIN_YEARS,
+        coverage_overrides={
+            # Structurally sparse but valuable, safely imputed features: park
+            # factors start one year after the first collected season; umpire
+            # and rolling-starter factors require prior appearances.
+            "park_factor": 0.60,
+            "umpire_run_factor": 0.80,
+            "home_sp_era_roll3": 0.80,
+            "home_sp_fip_roll3": 0.80,
+            "away_sp_era_roll3": 0.80,
+            "away_sp_fip_roll3": 0.80,
+        },
+    )
 
     PROCESSED.mkdir(parents=True, exist_ok=True)
     out_path = PROCESSED / "feature_matrix.csv"
-    game_df.to_csv(out_path, index=False)
+    atomic_write_csv(game_df, out_path)
     logger.info(f"Wrote {out_path} ({len(game_df)} rows, {len(game_df.columns)} columns)")
 
     names_path = PROCESSED / "feature_names.json"
-    with open(names_path, "w") as f:
-        json.dump({"all_candidate_features": feature_cols, "passing_features": passing_cols}, f, indent=2)
+    atomic_write_json({"all_candidate_features": feature_cols, "passing_features": passing_cols}, names_path)
     logger.info(f"Wrote {names_path} ({len(passing_cols)}/{len(feature_cols)} features passed coverage_check)")
+
+    raw_inventory = [
+        {"name": path.name, "size": path.stat().st_size, "mtime_ns": path.stat().st_mtime_ns}
+        for path in sorted(RAW.glob("*.csv"))
+    ]
+    data_version = hashlib.sha256(json.dumps(raw_inventory, sort_keys=True).encode()).hexdigest()
+    feature_hash = sha256_file(out_path)
+    production_scope = (
+        game_df[game_df["year"].isin(PRODUCTION_TRAIN_YEARS)][
+            ["game_pk", "date", "year", "home_win", *passing_cols]
+        ]
+        .sort_values("game_pk").reset_index(drop=True)
+    )
+    production_digest = hashlib.sha256("\x1f".join(production_scope.columns).encode())
+    production_digest.update(pd.util.hash_pandas_object(production_scope, index=False).values.tobytes())
+    production_feature_version = production_digest.hexdigest()
+    build_id = make_run_id("features")
+    manifest = {
+        "schema_version": 1,
+        "build_id": build_id,
+        "created_at_utc": utc_now_iso(),
+        "data_version": data_version,
+        "feature_matrix_sha256": feature_hash,
+        "production_feature_version": production_feature_version,
+        "row_count": len(game_df),
+        "column_count": len(game_df.columns),
+        "min_game_date": str(pd.to_datetime(game_df["date"]).min().date()),
+        "max_game_date": str(pd.to_datetime(game_df["date"]).max().date()),
+        "passing_features": passing_cols,
+        "raw_inventory": raw_inventory,
+    }
+    # Preserve a content-addressed completed-season training snapshot. It is
+    # stable during the live season, avoiding a new full-matrix copy every day.
+    snapshots = PROCESSED / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshots / f"production_training_{production_feature_version[:12]}.csv.gz"
+    if not snapshot_path.exists():
+        production_scope.to_csv(snapshot_path, index=False, compression="gzip")
+    manifest["production_training_snapshot"] = snapshot_path.name
+    atomic_write_json(manifest, PROCESSED / "feature_manifest.json")
+    logger.info(f"Feature build manifest: {build_id}; immutable snapshot: {snapshot_path.name}")
 
 
 if __name__ == "__main__":

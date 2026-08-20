@@ -15,7 +15,10 @@ import pandas as pd
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config.config import LEAGUE_AVG_SP, STADIUM_COORDS, TEAM_ABBREV_MAP, TRAIN_YEARS  # noqa: E402
+from config.config import (  # noqa: E402
+    LEAGUE_AVG_SP, STADIUM_COORDS, STADIUM_COORD_OVERRIDES,
+    TEAM_ABBREV_MAP, TRAIN_YEARS,
+)
 
 # Umpire starts needed (strictly before a given game) before umpire_run_factor is
 # trusted rather than left NaN — mirrors the R collector's old MIN_GAMES_FOR_FACTOR.
@@ -182,10 +185,11 @@ def build_schedule_features(df: pd.DataFrame) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
 
     host_team = np.where(df["is_home"] == 1, df["team"], df["opponent"])
-    coords = pd.DataFrame(STADIUM_COORDS).T.rename(columns={0: "lat", 1: "lon"})
-    host_coords = coords.reindex(host_team).reset_index(drop=True)
-    df["_lat"] = host_coords["lat"].values
-    df["_lon"] = host_coords["lon"].values
+    years = pd.to_numeric(df.get("year", df["date"].dt.year), errors="coerce").fillna(df["date"].dt.year).astype(int)
+    resolved = [STADIUM_COORD_OVERRIDES.get((team, year), STADIUM_COORDS.get(team, (np.nan, np.nan)))
+                for team, year in zip(host_team, years)]
+    df["_lat"] = [coord[0] for coord in resolved]
+    df["_lon"] = [coord[1] for coord in resolved]
 
     g = df.groupby("team", group_keys=False)
     prev_date = g["date"].shift(1)
@@ -384,20 +388,24 @@ def join_player_bio(df: pd.DataFrame, player_bio: pd.DataFrame, lineups: pd.Data
     lu["game_pk"] = lu["game_pk"].astype(str)
     bat_lookup = bio[["mlbam_id", "bat_side"]].dropna().drop_duplicates(subset=["mlbam_id"])
     lu = lu.merge(bat_lookup, left_on="batter_mlbam_id", right_on="mlbam_id", how="left")
-    lu["bats_left"] = (lu["bat_side"] == "L").astype(float)
-    lineup_hand = (
-        lu.groupby(["game_pk", "is_home"])["bats_left"].mean()
-        .reset_index().rename(columns={"bats_left": "lineup_pct_left"})
-    )
+    # A switch hitter bats right against a left-handed pitcher and left
+    # against a right-hander, so S must count as an advantage on either side.
+    for hand in ("L", "R", "S"):
+        lu[f"bats_{hand.lower()}"] = (lu["bat_side"] == hand).astype(float)
+    lineup_hand = lu.groupby(["game_pk", "is_home"])[["bats_l", "bats_r", "bats_s"]].mean().reset_index()
 
     df["game_pk"] = df["game_pk"].astype(str)
     df = df.merge(lineup_hand, on=["game_pk", "is_home"], how="left")
-    df["lineup_pct_left"] = df["lineup_pct_left"].fillna(0.40)  # roughly league-average LHB share
+    df[["bats_l", "bats_r", "bats_s"]] = df[["bats_l", "bats_r", "bats_s"]].fillna(
+        {"bats_l": 0.30, "bats_r": 0.60, "bats_s": 0.10}
+    )
 
     opp_sp_throws = np.where(df["is_home"] == 1, df.get("away_sp_throws"), df.get("home_sp_throws"))
-    # Opposing lefty -> platoon advantage is having more RHB (1 - pct_left); opposing righty -> more LHB.
-    df["platoon_advantage"] = np.where(opp_sp_throws == "L", 1 - df["lineup_pct_left"], df["lineup_pct_left"])
-    return df.drop(columns=["lineup_pct_left"])
+    df["platoon_advantage"] = np.where(
+        opp_sp_throws == "L", df["bats_r"] + df["bats_s"],
+        np.where(opp_sp_throws == "R", df["bats_l"] + df["bats_s"], np.nan),
+    )
+    return df.drop(columns=["bats_l", "bats_r", "bats_s"])
 
 
 def join_pitcher_rolling_form(df: pd.DataFrame, pitcher_gamelogs: pd.DataFrame) -> pd.DataFrame:
@@ -413,10 +421,11 @@ def join_pitcher_rolling_form(df: pd.DataFrame, pitcher_gamelogs: pd.DataFrame) 
     pg = pg.sort_values(["pitcher_name", "date"])
 
     g = pg.groupby("pitcher_name", group_keys=False)
-    shifted_era = g["era"].shift(1)
-    shifted_fip = g["fip"].shift(1)
-    pg["era_roll3"] = shifted_era.groupby(pg["pitcher_name"]).transform(lambda s: s.rolling(3, min_periods=1).mean())
-    pg["fip_roll3"] = shifted_fip.groupby(pg["pitcher_name"]).transform(lambda s: s.rolling(3, min_periods=1).mean())
+    # The lookup row represents information available *after* that completed
+    # start. merge_asof(exact=False) then gives a historical game its prior
+    # start and a future game the latest completed start—without double-lagging.
+    pg["era_roll3"] = g["era"].transform(lambda s: s.rolling(3, min_periods=1).mean())
+    pg["fip_roll3"] = g["fip"].transform(lambda s: s.rolling(3, min_periods=1).mean())
 
     rolling_lookup = pg[["pitcher_name", "date", "era_roll3", "fip_roll3"]].dropna(subset=["date"])
 
@@ -469,9 +478,9 @@ def join_park_factors(df: pd.DataFrame, park_factors: pd.DataFrame) -> pd.DataFr
 
 def join_umpires(df: pd.DataFrame, umpire_assignments: pd.DataFrame, umpire_game_log: pd.DataFrame) -> pd.DataFrame:
     """umpire_run_factor: the game's assigned home-plate umpire's average run
-    environment (that umpire's average total runs minus a TRAIN_YEARS-only
-    league baseline), computed using only that umpire's OTHER games strictly
-    before this one — never a later game, including a later season.
+    environment (that umpire's average total runs minus the league-average
+    run environment through prior dates), computed using only games strictly
+    before this one — never the same day's results or a later game/season.
 
     Two-tier lookup, not a single date-based asof match: for an
     already-played game (its game_pk is present in `umpire_game_log`) this
@@ -500,14 +509,18 @@ def join_umpires(df: pd.DataFrame, umpire_assignments: pd.DataFrame, umpire_game
     ug["date"] = pd.to_datetime(ug["date"])
     ug = ug.sort_values(["umpire_name", "date"])
 
-    train_mask = ug["date"].dt.year.isin(TRAIN_YEARS)
-    league_avg_runs = ug.loc[train_mask, "total_runs"].mean()
+    # One baseline per civil date, built from strictly earlier dates. A
+    # row-wise expanding mean could leak an earlier-finished same-day game
+    # into a later start even though both decisions are made pregame.
+    daily = ug.groupby("date")["total_runs"].agg(["sum", "count"]).sort_index()
+    daily["league_avg_before"] = daily["sum"].cumsum().shift(1) / daily["count"].cumsum().shift(1)
+    ug["league_avg_before"] = ug["date"].map(daily["league_avg_before"])
 
     g = ug.groupby("umpire_name", group_keys=False)
     shifted = g["total_runs"].shift(1)
     ug["cum_avg_runs"] = shifted.groupby(ug["umpire_name"]).transform(
         lambda s: s.expanding(min_periods=MIN_UMPIRE_GAMES_FOR_FACTOR).mean())
-    ug["umpire_run_factor"] = ug["cum_avg_runs"] - league_avg_runs
+    ug["umpire_run_factor"] = ug["cum_avg_runs"] - ug["league_avg_before"]
 
     # Tier 1: exact game_pk match (already-played games).
     by_game = (ug[["game_pk", "umpire_run_factor"]]
@@ -572,12 +585,15 @@ def pivot_to_game_level(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def coverage_check(df: pd.DataFrame, feature_cols: list, min_coverage: float = 0.95,
-                    train_years=(2021, 2022, 2023, 2024, 2025)) -> list:
+                    train_years=None,
+                    coverage_overrides=None) -> list:
     """Checks non-null coverage of each candidate feature column, restricted
     to `train_years` rows. Prints a coverage table, logs a WARNING for any
     column under `min_coverage`, and returns only the columns that pass
     (never silently drops without logging).
     """
+    train_years = TRAIN_YEARS if train_years is None else train_years
+    coverage_overrides = coverage_overrides or {}
     scoped = df[df["year"].isin(train_years)]
     n = len(scoped)
     passed = []
@@ -587,10 +603,11 @@ def coverage_check(df: pd.DataFrame, feature_cols: list, min_coverage: float = 0
             logger.warning(f"  {col}: MISSING from dataframe entirely — excluded.")
             continue
         coverage = scoped[col].notna().mean() if n > 0 else 0.0
-        status = "PASS" if coverage >= min_coverage else "FAIL"
+        threshold = coverage_overrides.get(col, min_coverage)
+        status = "PASS" if coverage >= threshold else "FAIL"
         logger.info(f"  {col:30s} {coverage:6.1%}  [{status}]")
-        if coverage >= min_coverage:
+        if coverage >= threshold:
             passed.append(col)
         else:
-            logger.warning(f"  {col}: coverage {coverage:.1%} < {min_coverage:.0%} threshold — excluded from model.")
+            logger.warning(f"  {col}: coverage {coverage:.1%} < {threshold:.0%} threshold — excluded from model.")
     return passed

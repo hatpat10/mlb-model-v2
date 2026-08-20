@@ -235,10 +235,8 @@ def join_opposing_pitcher_rolling(df: pd.DataFrame, pitcher_gamelogs: pd.DataFra
     pg = pg.sort_values(["pitcher_name", "date"])
 
     g = pg.groupby("pitcher_name", group_keys=False)
-    shifted_era = g["era"].shift(1)
-    shifted_fip = g["fip"].shift(1)
-    pg["era_roll3"] = shifted_era.groupby(pg["pitcher_name"]).transform(lambda s: s.rolling(3, min_periods=1).mean())
-    pg["fip_roll3"] = shifted_fip.groupby(pg["pitcher_name"]).transform(lambda s: s.rolling(3, min_periods=1).mean())
+    pg["era_roll3"] = g["era"].transform(lambda s: s.rolling(3, min_periods=1).mean())
+    pg["fip_roll3"] = g["fip"].transform(lambda s: s.rolling(3, min_periods=1).mean())
 
     rolling_lookup = pg[["pitcher_name", "date", "era_roll3", "fip_roll3"]].dropna(subset=["date"])
     rolling_lookup = rolling_lookup.rename(columns={"pitcher_name": "opp_starter_name"})
@@ -266,6 +264,7 @@ def join_park_factors(df: pd.DataFrame, park_factors: pd.DataFrame) -> pd.DataFr
     pf = park_factors.copy()
     pf["team"] = normalize_team_abbrev(pf["team"])
     pf = pf[["team", "year", "park_factor"]].drop_duplicates(subset=["team", "year"])
+    pf["year"] = pf["year"] + 1
 
     df = df.copy()
     df["_host_team"] = np.where(df["is_home"] == 1, df["team"], df["opp"])

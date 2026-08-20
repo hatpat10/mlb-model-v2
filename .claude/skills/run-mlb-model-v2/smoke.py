@@ -23,7 +23,8 @@ from pathlib import Path
 from datetime import datetime
 
 ROOT = Path(__file__).resolve().parents[3]
-VENV_PY = ROOT / "venv" / "Scripts" / "python.exe"
+_ROOT_VENV_PY = ROOT / "venv" / "Scripts" / "python.exe"
+VENV_PY = _ROOT_VENV_PY if _ROOT_VENV_PY.exists() else Path(sys.executable)
 SCRIPTS = ROOT / "scripts"
 
 # joblib models pickle classes from scripts/model_classes.py — unpickling
@@ -43,8 +44,7 @@ def check(label, ok, detail=""):
 
 
 def check_environment():
-    check("venv interpreter", Path(sys.executable).resolve() == VENV_PY.resolve(),
-          f"running under {sys.executable}")
+    check("venv interpreter", Path(sys.executable).resolve() == VENV_PY.resolve(), f"running under {sys.executable}")
     env_text = (ROOT / ".env").read_text() if (ROOT / ".env").exists() else ""
     check(".env has ODDS_API_KEY", "ODDS_API_KEY=" in env_text)
     for rel in ("data/raw/game_logs_all.csv", "data/processed/feature_matrix.csv",
@@ -59,7 +59,8 @@ def check_imports():
     # functions directly (see SKILL.md "Direct invocation").
     for name in ("model_classes", "odds_utils", "01_build_features", "02_train",
                  "03_backtest", "04_predict", "05_bankroll", "06_runner",
-                 "07_capture_closing_lines", "wait_for_odds_and_predict"):
+                 "07_capture_closing_lines", "wait_for_odds_and_predict",
+                 "artifact_utils", "betting_strategy", "pipeline_health", "model_registry"):
         path = SCRIPTS / f"{name}.py"
         try:
             spec = importlib.util.spec_from_file_location(f"smoke_{name}", path)
@@ -120,6 +121,7 @@ def main():
     check_environment()
     check_imports()
     check_model_scoring()
+    run_script("-m", ["unittest", "discover", "-s", "tests", "-v"])
     run_script("scripts/03_backtest.py")
 
     if args.predict:

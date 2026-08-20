@@ -127,7 +127,7 @@ def tune_xgb(X, y, tscv):
             devs.append(mean_poisson_deviance(y.iloc[val_idx], preds))
         return float(np.mean(devs))
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
     logger.info(f"XGBoost: best CV Poisson deviance={study.best_value:.4f}, params={study.best_params}")
     return study.best_params
@@ -154,7 +154,7 @@ def tune_lgbm(X, y, tscv):
             devs.append(mean_poisson_deviance(y.iloc[val_idx], preds))
         return float(np.mean(devs))
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
     logger.info(f"LightGBM: best CV Poisson deviance={study.best_value:.4f}, params={study.best_params}")
     return study.best_params
@@ -226,7 +226,12 @@ def main():
 
     report_path = OUTPUTS / f"props_train_report_{args.matrix}_{args.market}.json"
     with open(report_path, "w") as f:
-        json.dump({"matrix": args.matrix, "market": args.market, "test_year": TEST_YEAR, "results": results}, f, indent=2)
+        json.dump({
+            "matrix": args.matrix, "market": args.market, "test_year": TEST_YEAR,
+            "deployment_ready": False,
+            "deployment_blocker": "No real timestamped sportsbook prop lines/odds or push-aware settlement dataset",
+            "results": results,
+        }, f, indent=2)
     logger.info(f"Wrote {report_path}")
 
 

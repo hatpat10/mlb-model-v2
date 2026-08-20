@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Central configuration for the MLB moneyline model."""
 
+import os
+from datetime import date
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,6 +27,15 @@ MIN_EDGE_MONEYLINE = 0.06
 MAX_EDGE_MONEYLINE = 0.20
 KELLY_FRACTION = 0.25
 DRAWDOWN_PAUSE_THRESHOLD = 0.20
+MAX_BET_BANKROLL_FRACTION = 0.02
+MAX_DAILY_EXPOSURE_FRACTION = 0.08
+MAX_OPEN_EXPOSURE_FRACTION = 0.15
+MIN_BET_SIZE = 1.00
+MIN_STRATEGY_VALIDATION_BETS = 200
+MIN_STRATEGY_VALIDATION_COVERAGE = 0.80
+REQUIRE_POSTED_LINEUPS_FOR_BET = True
+REQUIRE_UMPIRE_FOR_BET = False
+BETTING_BACKUP_BRANCH = os.getenv("BETTING_BACKUP_BRANCH", "main")
 
 # --------------------------------------------------------------------------
 # Modeling windows
@@ -32,7 +43,11 @@ DRAWDOWN_PAUSE_THRESHOLD = 0.20
 TRAIN_YEARS = [2021, 2022, 2023]
 TEST_YEAR = 2024
 CALIBRATION_YEARS = [2022, 2023]
-ALL_DATA_YEARS = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
+CURRENT_YEAR = date.today().year
+ALL_DATA_YEARS = list(range(2020, CURRENT_YEAR + 1))
+PRODUCTION_TRAIN_YEARS = list(range(2021, CURRENT_YEAR))
+PRODUCTION_CALIBRATION_YEARS = PRODUCTION_TRAIN_YEARS[-2:]
+PRODUCTION_OPTUNA_TRIALS = 30
 
 # --------------------------------------------------------------------------
 # Standard 30-team abbreviation set
@@ -112,6 +127,15 @@ STADIUM_COORDS = {
     "TEX": (32.7473, -97.0842),    # Globe Life Field
     "TOR": (43.6414, -79.3894),    # Rogers Centre
     "WSH": (38.8730, -77.0074),    # Nationals Park
+}
+
+# Temporary venue overrides. Keeping these time-aware preserves historical
+# Oakland/Tampa travel features while using the clubs' actual current parks.
+STADIUM_COORD_OVERRIDES = {
+    ("OAK", 2025): (38.5802, -121.5130),  # Sutter Health Park, Sacramento
+    ("OAK", 2026): (38.5802, -121.5130),
+    ("OAK", 2027): (38.5802, -121.5130),
+    ("TB", 2025): (27.9800, -82.5065),    # George M. Steinbrenner Field
 }
 
 # --------------------------------------------------------------------------

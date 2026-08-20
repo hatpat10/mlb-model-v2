@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-# Orchestrates all R data-collection scripts in order. A failure in any one
-# script is logged and does not stop the others from running. Prints a
-# final summary of which scripts succeeded/failed and the row counts of
-# every output CSV.
+# Orchestrates all R data-collection scripts in order. All collectors are
+# attempted, but the process exits non-zero when a core collector or its
+# required output fails so downstream feature/prediction steps fail closed.
 #
 # Run from the project root: Rscript R/00_run_all.R
 
@@ -35,7 +34,7 @@ OUTPUT_GLOBS <- list(
   "R/04_collect_statcast_team.R" = sprintf("statcast_team_batting_%d.csv", 2020:CUR),
   "R/05_collect_statcast_sp.R" = sprintf("statcast_sp_%d.csv", 2020:CUR),
   "R/06_collect_park_factors.R" = c("park_factors.csv"),
-  "R/07_collect_umpires.R" = c("umpire_assignments.csv", "umpire_factors.csv"),
+  "R/07_collect_umpires.R" = c("umpire_assignments.csv", "umpire_game_log.csv"),
   "R/08_collect_player_ids.R" = c("player_id_crosswalk.csv"),
   "R/09_collect_team_fielding.R" = sprintf("team_fielding_%d.csv", 2020:CUR),
   "R/10_collect_batter_stats.R" = sprintf("batter_stats_%d.csv", 2020:CUR),
@@ -91,12 +90,27 @@ for (script in SCRIPTS) {
   }
 }
 
-if (n_core_success < 4) {
-  log_msg("CRITICAL: fewer than 4/7 CORE collection scripts (01-07) succeeded. Data foundation is not solid.")
-  log_msg("Do not proceed to feature engineering until this is investigated.")
+required_outputs <- c(
+  "game_logs_all.csv", "park_factors.csv",
+  "umpire_assignments.csv", "umpire_game_log.csv"
+)
+missing_required <- required_outputs[
+  !vapply(file.path(RAW_DIR, required_outputs), function(path) {
+    file.exists(path) && file.info(path)$size > 0
+  }, logical(1))
+]
+
+pipeline_ok <- n_core_success == length(CORE_SCRIPTS) && length(missing_required) == 0
+if (!pipeline_ok) {
+  log_msg("CRITICAL: core collection gate failed (%d/%d scripts succeeded).", n_core_success, length(CORE_SCRIPTS))
+  if (length(missing_required) > 0) {
+    log_msg("Missing/empty required outputs: %s", paste(missing_required, collapse = ", "))
+  }
+  log_msg("Downstream feature engineering and prediction must not proceed.")
 }
 n_enhancement_success <- n_success - n_core_success
 log_msg("Enhancement scripts (08-14, player IDs/fielding/batters/pitcher logs/lineups/bio/boxscores): %d/%d succeeded",
         n_enhancement_success, length(SCRIPTS) - length(CORE_SCRIPTS))
 
 log_msg("========== R data collection: done ==========")
+if (!pipeline_ok) quit(save = "no", status = 1)

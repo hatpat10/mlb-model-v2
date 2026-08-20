@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Park factors for 2021-2026.
+# Park factors from 2021 through the current season.
 #
 # baseballr::fg_park() is broken as of this baseballr release — FanGraphs
 # changed their park-factors page and the scraper throws

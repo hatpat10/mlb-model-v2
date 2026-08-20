@@ -5,6 +5,7 @@ models, and reports AUC/accuracy/Brier/ECE on the untouched 2024 holdout.
 """
 import sys
 import json
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -21,13 +22,21 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
 from sklearn.isotonic import IsotonicRegression
 from sklearn.calibration import calibration_curve
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 import lightgbm as lgb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config.config import PATHS, TRAIN_YEARS, TEST_YEAR, CALIBRATION_YEARS  # noqa: E402
+from config.config import (  # noqa: E402
+    PATHS, TRAIN_YEARS, TEST_YEAR, CALIBRATION_YEARS,
+    PRODUCTION_TRAIN_YEARS, PRODUCTION_CALIBRATION_YEARS,
+    PRODUCTION_OPTUNA_TRIALS,
+)
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
+from artifact_utils import atomic_write_json, make_run_id, sha256_file, utc_now_iso  # noqa: E402
+from model_registry import publish_production_model  # noqa: E402
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -43,7 +52,7 @@ logger.add(sys.stderr, level="INFO")
 logger.add(LOGS / "02_train.log", level="DEBUG", rotation="5 MB")
 
 
-def load_data():
+def load_data(mode="benchmark"):
     fm_path = PROCESSED / "feature_matrix.csv"
     names_path = PROCESSED / "feature_names.json"
     if not fm_path.exists() or not names_path.exists():
@@ -58,17 +67,19 @@ def load_data():
         names = json.load(f)
     features = names["passing_features"]
 
-    train_df = df[df["year"].isin(TRAIN_YEARS)].reset_index(drop=True)
-    test_df = df[df["year"] == TEST_YEAR].reset_index(drop=True)
-    logger.info(f"train (years {TRAIN_YEARS}): {len(train_df)} rows | test (year {TEST_YEAR}): {len(test_df)} rows")
-    return train_df, test_df, features
+    train_years = TRAIN_YEARS if mode == "benchmark" else PRODUCTION_TRAIN_YEARS
+    eval_year = TEST_YEAR if mode == "benchmark" else max(PRODUCTION_TRAIN_YEARS)
+    train_df = df[df["year"].isin(train_years)].reset_index(drop=True)
+    test_df = df[df["year"] == eval_year].reset_index(drop=True)
+    logger.info(f"{mode} train (years {train_years}): {len(train_df)} rows | reporting year {eval_year}: {len(test_df)} rows")
+    return train_df, test_df, features, train_years, eval_year
 
 
-def median_impute(train_df, test_df, features):
+def median_impute(train_df, test_df, features, artifact_dir):
     medians = train_df[features].median()
     train_X = train_df[features].fillna(medians)
     test_X = test_df[features].fillna(medians)
-    joblib.dump(medians, MODELS / "train_medians.joblib")
+    joblib.dump(medians, artifact_dir / "train_medians.joblib")
     logger.info(f"Median-imputed {features.__len__()} features using train-only medians.")
     return train_X, test_X
 
@@ -78,7 +89,7 @@ def tune_logreg(X, y, tscv):
     for c in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
         aucs = []
         for tr_idx, val_idx in tscv.split(X):
-            model = LogisticRegression(penalty="l2", C=c, max_iter=2000, solver="lbfgs")
+            model = make_pipeline(StandardScaler(), LogisticRegression(C=c, max_iter=5000, solver="lbfgs"))
             model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
             preds = model.predict_proba(X.iloc[val_idx])[:, 1]
             aucs.append(roc_auc_score(y.iloc[val_idx], preds))
@@ -86,7 +97,7 @@ def tune_logreg(X, y, tscv):
         if mean_auc > best_auc:
             best_auc, best_c = mean_auc, c
     logger.info(f"LogisticRegression: best C={best_c} (CV AUC={best_auc:.4f})")
-    return {"C": best_c, "penalty": "l2", "max_iter": 2000, "solver": "lbfgs"}
+    return {"C": best_c, "max_iter": 5000, "solver": "lbfgs"}
 
 
 def tune_xgb(X, y, tscv):
@@ -109,7 +120,7 @@ def tune_xgb(X, y, tscv):
             aucs.append(roc_auc_score(y.iloc[val_idx], preds))
         return float(np.mean(aucs))
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
     logger.info(f"XGBoost: best CV AUC={study.best_value:.4f}, params={study.best_params}")
     return study.best_params
@@ -136,7 +147,7 @@ def tune_lgbm(X, y, tscv):
             aucs.append(roc_auc_score(y.iloc[val_idx], preds))
         return float(np.mean(aucs))
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=False)
     logger.info(f"LightGBM: best CV AUC={study.best_value:.4f}, params={study.best_params}")
     return study.best_params
@@ -144,7 +155,7 @@ def tune_lgbm(X, y, tscv):
 
 def make_model(name, params):
     if name == "lr":
-        return LogisticRegression(**params)
+        return make_pipeline(StandardScaler(), LogisticRegression(**params))
     if name == "xgb":
         return xgb.XGBClassifier(**params, eval_metric="logloss", random_state=42)
     if name == "lgbm":
@@ -184,13 +195,25 @@ def expected_calibration_error(y_true, y_prob, n_bins=10):
 
 
 def main():
+    global N_OPTUNA_TRIALS
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("benchmark", "production"), default="benchmark")
+    parser.add_argument("--trials", type=int, default=None)
+    args = parser.parse_args()
+    N_OPTUNA_TRIALS = args.trials if args.trials is not None else (
+        N_OPTUNA_TRIALS if args.mode == "benchmark" else PRODUCTION_OPTUNA_TRIALS
+    )
+
     MODELS.mkdir(parents=True, exist_ok=True)
     OUTPUTS.mkdir(parents=True, exist_ok=True)
+    model_version = make_run_id(f"model_{args.mode}")
+    artifact_dir = MODELS if args.mode == "benchmark" else MODELS / "production" / model_version
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df, test_df, features = load_data()
+    train_df, test_df, features, train_years, eval_year = load_data(args.mode)
     y_train = train_df["home_win"].astype(int)
     y_test = test_df["home_win"].astype(int)
-    X_train, X_test = median_impute(train_df, test_df, features)
+    X_train, X_test = median_impute(train_df, test_df, features, artifact_dir)
 
     tscv = TimeSeriesSplit(n_splits=N_SPLITS)
 
@@ -228,11 +251,12 @@ def main():
         model.fit(X_train, y_train)
 
     ensemble = WeightedEnsembleClassifier(models=final_models, weights=weights)
-    joblib.dump(ensemble, MODELS / "ensemble.joblib")
-    logger.info("Saved models/ensemble.joblib")
+    joblib.dump(ensemble, artifact_dir / "ensemble.joblib")
+    logger.info(f"Saved {artifact_dir / 'ensemble.joblib'}")
 
-    calib_mask = train_df["year"].isin(CALIBRATION_YEARS).values
-    logger.info(f"Fitting isotonic calibration on {calib_mask.sum()} out-of-fold rows from years {CALIBRATION_YEARS}")
+    calibration_years = CALIBRATION_YEARS if args.mode == "benchmark" else PRODUCTION_CALIBRATION_YEARS
+    calib_mask = train_df["year"].isin(calibration_years).values
+    logger.info(f"Fitting isotonic calibration on {calib_mask.sum()} out-of-fold rows from years {calibration_years}")
 
     calibrated_models = {}
     for name in ("xgb", "lgbm"):
@@ -242,15 +266,16 @@ def main():
         iso.fit(oof_preds[valid], y_train.values[valid])
         calibrated = PreFitCalibratedClassifier(base_estimator=final_models[name], calibrator=iso)
         calibrated_models[name] = calibrated
-        joblib.dump(calibrated, MODELS / f"{name}_calibrated.joblib")
-        logger.info(f"Saved models/{name}_calibrated.joblib ({valid.sum()} calibration points)")
+        joblib.dump(calibrated, artifact_dir / f"{name}_calibrated.joblib")
+        logger.info(f"Saved {artifact_dir / f'{name}_calibrated.joblib'} ({valid.sum()} calibration points)")
 
     with open(PROCESSED / "feature_names.json") as f:
         names_blob = json.load(f)
-    with open(MODELS / "feature_names.json", "w") as f:
+    with open(artifact_dir / "feature_names.json", "w") as f:
         json.dump(names_blob, f, indent=2)
 
-    logger.info("========== 2024 HOLDOUT EVALUATION ==========")
+    evaluation_label = f"{eval_year} HOLDOUT" if args.mode == "benchmark" else f"{eval_year} TRAINING DIAGNOSTIC"
+    logger.info(f"========== {evaluation_label} ==========")
     xgb_test_proba = calibrated_models["xgb"].predict_proba(X_test)[:, 1]
     lgbm_test_proba = calibrated_models["lgbm"].predict_proba(X_test)[:, 1]
     avg_calibrated_proba = (xgb_test_proba + lgbm_test_proba) / 2.0
@@ -275,12 +300,38 @@ def main():
     plt.plot(mean_pred, frac_pos, marker="o", label="avg(calibrated XGB, LGBM)")
     plt.xlabel("Mean predicted probability")
     plt.ylabel("Fraction of actual home wins")
-    plt.title(f"Calibration curve — {TEST_YEAR} holdout")
+    plt.title(f"Calibration curve — {evaluation_label.lower()}")
     plt.legend()
     plt.tight_layout()
-    plot_path = OUTPUTS / f"calibration_plot_{TEST_YEAR}.png"
+    plot_path = OUTPUTS / (f"calibration_plot_{TEST_YEAR}.png" if args.mode == "benchmark" else "calibration_plot_production.png")
     plt.savefig(plot_path, dpi=150)
     logger.info(f"Saved calibration plot to {plot_path}")
+
+    feature_manifest_path = PROCESSED / "feature_manifest.json"
+    feature_manifest = {}
+    if feature_manifest_path.exists():
+        with open(feature_manifest_path, encoding="utf-8") as handle:
+            feature_manifest = json.load(handle)
+    model_files = ["train_medians.joblib", "ensemble.joblib", "xgb_calibrated.joblib", "lgbm_calibrated.joblib", "feature_names.json"]
+    manifest = {
+        "schema_version": 1,
+        "model_version": model_version,
+        "created_at_utc": utc_now_iso(),
+        "mode": args.mode,
+        "training_years": train_years,
+        "calibration_years": calibration_years,
+        "evaluation_year": eval_year,
+        "optuna_trials": N_OPTUNA_TRIALS,
+        "feature_build_id": feature_manifest.get("build_id"),
+        "data_version": feature_manifest.get("data_version"),
+        "feature_matrix_sha256": feature_manifest.get("feature_matrix_sha256"),
+        "production_feature_version": feature_manifest.get("production_feature_version"),
+        "artifacts": {name: sha256_file(artifact_dir / name) for name in model_files},
+    }
+    atomic_write_json(manifest, artifact_dir / "manifest.json")
+    if args.mode == "production":
+        publish_production_model(MODELS, artifact_dir, model_version)
+    logger.info(f"Saved attributable {args.mode} model manifest: {manifest['model_version']}")
 
 
 if __name__ == "__main__":

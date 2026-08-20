@@ -18,9 +18,15 @@ from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config.config import PATHS, TEST_YEAR, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE  # noqa: E402
+from config.config import (  # noqa: E402
+    PATHS, TEST_YEAR, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE,
+    MIN_STRATEGY_VALIDATION_BETS, MIN_STRATEGY_VALIDATION_COVERAGE,
+)
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from odds_utils import american_to_decimal_odds  # noqa: E402
+from betting_strategy import american_to_decimal, size_stake  # noqa: E402
+from artifact_utils import atomic_write_json  # noqa: E402
+from model_registry import resolve_production_model_dir  # noqa: E402
 
 RAW = PATHS["raw"]
 PROCESSED = PATHS["processed"]
@@ -33,30 +39,30 @@ logger.add(sys.stderr, level="INFO")
 logger.add(LOGS / "03_backtest.log", level="DEBUG", rotation="5 MB")
 
 
-def load_holdout_predictions():
-    with open(MODELS / "feature_names.json") as f:
+def load_scored_rows(model_dir=MODELS, start_year=TEST_YEAR):
+    with open(model_dir / "feature_names.json") as f:
         features = json.load(f)["passing_features"]
-    medians = joblib.load(MODELS / "train_medians.joblib")
-    xgb_cal = joblib.load(MODELS / "xgb_calibrated.joblib")
-    lgbm_cal = joblib.load(MODELS / "lgbm_calibrated.joblib")
+    medians = joblib.load(model_dir / "train_medians.joblib")
+    xgb_cal = joblib.load(model_dir / "xgb_calibrated.joblib")
+    lgbm_cal = joblib.load(model_dir / "lgbm_calibrated.joblib")
 
     df = pd.read_csv(PROCESSED / "feature_matrix.csv")
-    test_df = df[df["year"] == TEST_YEAR].reset_index(drop=True)
-    X_test = test_df[features].fillna(medians)
+    scored = df[df["year"] >= start_year].reset_index(drop=True)
+    X_test = scored[features].fillna(medians)
 
     home_prob = (xgb_cal.predict_proba(X_test)[:, 1] + lgbm_cal.predict_proba(X_test)[:, 1]) / 2.0
-    test_df = test_df.copy()
-    test_df["model_home_prob"] = home_prob
-    return test_df
+    scored = scored.copy()
+    scored["model_home_prob"] = home_prob
+    return scored
 
 
-def evaluate_accuracy(test_df):
+def evaluate_accuracy(test_df, label="2024 holdout"):
     y = test_df["home_win"].values
     p = test_df["model_home_prob"].values
     auc = roc_auc_score(y, p)
     acc = accuracy_score(y, (p >= 0.5).astype(int))
     brier = brier_score_loss(y, p)
-    logger.info(f"2024 holdout — AUC={auc:.4f}  Accuracy={acc:.4f}  Brier={brier:.4f}")
+    logger.info(f"{label} — AUC={auc:.4f}  Accuracy={acc:.4f}  Brier={brier:.4f}")
     return auc, acc, brier
 
 
@@ -88,32 +94,85 @@ def moneyline_roi(test_df, home_fair_prob, label, home_ml_close=None, away_ml_cl
     bet_away = (-edge >= MIN_EDGE_MONEYLINE) & (-edge < MAX_EDGE_MONEYLINE)
 
     home_win = test_df["home_win"].values
-    pnl = np.zeros(len(test_df))
-
-    if home_ml_close is not None and away_ml_close is not None:
-        home_decimal_odds = american_to_decimal_odds(home_ml_close)
-        away_decimal_odds = american_to_decimal_odds(away_ml_close)
+    if home_ml_close is None or away_ml_close is None:
+        # The proxy is intentionally unit-staked and cannot validate the
+        # deployable sizing strategy because no bookmaker quote existed.
+        home_decimal_odds = 1.0 / home_fair_prob
+        away_decimal_odds = 1.0 / (1.0 - home_fair_prob)
+        pnl = np.zeros(len(test_df))
+        pnl[bet_home & (home_win == 1)] = (home_decimal_odds - 1)[bet_home & (home_win == 1)]
+        pnl[bet_home & (home_win == 0)] = -1
+        pnl[bet_away & (home_win == 0)] = (away_decimal_odds - 1)[bet_away & (home_win == 0)]
+        pnl[bet_away & (home_win == 1)] = -1
+        n_bets = int((bet_home | bet_away).sum())
+        total_staked = float(n_bets)
+        total_pnl = float(pnl[bet_home | bet_away].sum())
+        final_bankroll = None
+        max_drawdown = None
     else:
-        home_decimal_odds = np.divide(1.0, home_fair_prob, out=np.full_like(home_fair_prob, np.nan), where=home_fair_prob > 0)
-        away_decimal_odds = np.divide(1.0, (1 - home_fair_prob), out=np.full_like(home_fair_prob, np.nan), where=(1 - home_fair_prob) > 0)
-
-    pnl[bet_home & (home_win == 1)] = (home_decimal_odds - 1)[bet_home & (home_win == 1)]
-    pnl[bet_home & (home_win == 0)] = -1
-    pnl[bet_away & (home_win == 0)] = (away_decimal_odds - 1)[bet_away & (home_win == 0)]
-    pnl[bet_away & (home_win == 1)] = -1
-
-    n_bets = int((bet_home | bet_away).sum())
-    total_pnl = pnl[bet_home | bet_away].sum()
-    roi = total_pnl / n_bets if n_bets > 0 else np.nan
+        simulation = test_df.copy()
+        simulation["_fair"] = home_fair_prob
+        simulation["_bet_home"] = bet_home
+        simulation["_bet_away"] = bet_away
+        simulation["_home_ml"] = home_ml_close
+        simulation["_away_ml"] = away_ml_close
+        simulation = simulation.sort_values(["date", "game_pk"]).reset_index(drop=True)
+        bankroll, peak, max_drawdown = 10000.0, 10000.0, 0.0
+        bet_pnls, bet_stakes = [], []
+        total_staked, total_pnl, n_bets = 0.0, 0.0, 0
+        for _, day in simulation.groupby("date", sort=True):
+            daily_staked = 0.0
+            day_pnl = 0.0
+            for _, row in day.iterrows():
+                if not (row["_bet_home"] or row["_bet_away"]):
+                    continue
+                side_home = bool(row["_bet_home"])
+                probability = row["model_home_prob"] if side_home else 1.0 - row["model_home_prob"]
+                odds = row["_home_ml"] if side_home else row["_away_ml"]
+                if pd.isna(odds):
+                    continue
+                sizing = size_stake(probability, odds, bankroll, daily_staked=daily_staked, open_staked=daily_staked)
+                if sizing.stake <= 0:
+                    continue
+                won = bool(row["home_win"]) if side_home else not bool(row["home_win"])
+                bet_pnl = sizing.stake * (american_to_decimal(odds) - 1.0) if won else -sizing.stake
+                daily_staked += sizing.stake
+                total_staked += sizing.stake
+                total_pnl += bet_pnl
+                day_pnl += bet_pnl
+                n_bets += 1
+                bet_pnls.append(bet_pnl)
+                bet_stakes.append(sizing.stake)
+            bankroll += day_pnl
+            peak = max(peak, bankroll)
+            max_drawdown = max(max_drawdown, 1.0 - bankroll / peak)
+        final_bankroll = bankroll
+        if n_bets >= 2:
+            rng = np.random.default_rng(42)
+            idx = rng.integers(0, n_bets, size=(5000, n_bets))
+            pnl_arr, stake_arr = np.asarray(bet_pnls), np.asarray(bet_stakes)
+            bootstrap_roi = pnl_arr[idx].sum(axis=1) / stake_arr[idx].sum(axis=1)
+            roi_ci_95 = [float(value) for value in np.quantile(bootstrap_roi, [0.025, 0.975])]
+        else:
+            roi_ci_95 = None
+    roi = total_pnl / total_staked if total_staked > 0 else np.nan
 
     logger.info(f"ROI vs {label} closing lines: {n_bets} bets placed / {len(test_df)} games, "
-                f"total PnL={total_pnl:.2f} units, ROI={roi:.2%}" if n_bets > 0 else
+                f"total stake={total_staked:.2f}, PnL={total_pnl:.2f}, ROI={roi:.2%}" if n_bets > 0 else
                 f"ROI vs {label} closing lines: 0 bets placed (no games met the edge threshold)")
-    return {"label": label, "n_bets": n_bets, "total_pnl": float(total_pnl), "roi": float(roi) if n_bets > 0 else None}
+    return {
+        "label": label, "n_bets": n_bets, "total_staked": float(total_staked),
+        "total_pnl": float(total_pnl), "roi": float(roi) if n_bets > 0 else None,
+        "starting_bankroll": 10000.0 if final_bankroll is not None else None,
+        "final_bankroll": float(final_bankroll) if final_bankroll is not None else None,
+        "max_drawdown": float(max_drawdown) if max_drawdown is not None else None,
+        "roi_ci_95": roi_ci_95 if final_bankroll is not None else None,
+    }
 
 
 def main():
-    test_df = load_holdout_predictions()
+    scored = load_scored_rows()
+    test_df = scored[scored["year"] == TEST_YEAR].reset_index(drop=True)
     auc, acc, brier = evaluate_accuracy(test_df)
 
     real_odds = load_real_closing_lines()
@@ -122,15 +181,23 @@ def main():
     if real_odds is not None:
         # feature_matrix game_pk reads back as int64; odds files store it as
         # str — without this cast the merge silently matches zero rows.
-        test_df = test_df.copy()
-        test_df["game_pk"] = test_df["game_pk"].astype(str)
-        merged = test_df.merge(real_odds, on="game_pk", how="inner")
-        logger.info(f"Found REAL closing-line data for {len(merged)}/{len(test_df)} holdout games.")
+        oos = scored.copy()
+        oos["game_pk"] = oos["game_pk"].astype(str)
+        odds_for_merge = real_odds.drop_duplicates("game_pk", keep="last").drop(
+            columns=[column for column in ("date", "home_team", "away_team") if column in real_odds.columns]
+        )
+        merged = oos.merge(odds_for_merge, on="game_pk", how="inner")
+        collected_dates = set(pd.to_datetime(real_odds["date"]).dt.strftime("%Y-%m-%d")) if "date" in real_odds else set()
+        games_on_collected_dates = oos[pd.to_datetime(oos["date"]).dt.strftime("%Y-%m-%d").isin(collected_dates)]
+        coverage = len(merged) / len(games_on_collected_dates) if len(games_on_collected_dates) else 0.0
+        logger.info(f"Found REAL closing-line data for {len(merged)}/{len(games_on_collected_dates)} "
+                    f"out-of-sample games on captured dates ({coverage:.1%} coverage).")
         if len(merged) > 0:
             results["roi_real"] = moneyline_roi(
                 merged, merged["home_no_vig_prob"].values, label="REAL",
                 home_ml_close=merged["home_ml_close"].values, away_ml_close=merged["away_ml_close"].values,
             )
+            results["roi_real"]["market_coverage"] = coverage
         else:
             logger.warning("No holdout games matched real closing-line data by game_pk.")
     else:
@@ -145,11 +212,49 @@ def main():
     # False until a real-price backtest has actually run with enough bets to
     # mean anything — never true from the synthetic Elo-proxy path, and not
     # true just because a real-price run happened to place zero bets.
-    results["strategy_validated"] = bool(results.get("roi_real", {}).get("n_bets", 0) > 0)
+    production_dir = resolve_production_model_dir(MODELS)
+    if real_odds is not None and production_dir is not None:
+        with open(production_dir / "manifest.json", encoding="utf-8") as handle:
+            production_manifest = json.load(handle)
+        production_start = max(production_manifest["training_years"]) + 1
+        production_scored = load_scored_rows(production_dir, production_start)
+        if not production_scored.empty:
+            pa, pc, pb = evaluate_accuracy(production_scored, f"production {production_start}+ out-of-sample")
+            results["production_accuracy"] = {"auc": pa, "accuracy": pc, "brier": pb}
+            production_scored["game_pk"] = production_scored["game_pk"].astype(str)
+            production_odds = real_odds.drop_duplicates("game_pk", keep="last").drop(
+                columns=[column for column in ("date", "home_team", "away_team") if column in real_odds.columns]
+            )
+            production_merged = production_scored.merge(production_odds, on="game_pk", how="inner")
+            collected_dates = set(pd.to_datetime(real_odds["date"]).dt.strftime("%Y-%m-%d")) if "date" in real_odds else set()
+            production_denominator = production_scored[
+                pd.to_datetime(production_scored["date"]).dt.strftime("%Y-%m-%d").isin(collected_dates)
+            ]
+            production_coverage = len(production_merged) / len(production_denominator) if len(production_denominator) else 0.0
+            if not production_merged.empty:
+                results["roi_production_real"] = moneyline_roi(
+                    production_merged, production_merged["home_no_vig_prob"].values,
+                    label="PRODUCTION REAL",
+                    home_ml_close=production_merged["home_ml_close"].values,
+                    away_ml_close=production_merged["away_ml_close"].values,
+                )
+                results["roi_production_real"]["market_coverage"] = production_coverage
+                results["roi_production_real"]["model_version"] = production_manifest.get("model_version")
+
+    real_result = results.get("roi_production_real", results.get("roi_real", {}))
+    results["validation_thresholds"] = {
+        "minimum_real_bets": MIN_STRATEGY_VALIDATION_BETS,
+        "minimum_market_coverage": MIN_STRATEGY_VALIDATION_COVERAGE,
+    }
+    results["strategy_validated"] = bool(
+        real_result.get("n_bets", 0) >= MIN_STRATEGY_VALIDATION_BETS
+        and real_result.get("market_coverage", 0.0) >= MIN_STRATEGY_VALIDATION_COVERAGE
+        and real_result.get("roi_ci_95") is not None
+        and real_result["roi_ci_95"][0] > 0
+    )
 
     out_path = OUTPUTS / f"backtest_{TEST_YEAR}.json"
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+    atomic_write_json(results, out_path)
     logger.info(f"Wrote {out_path}")
 
 

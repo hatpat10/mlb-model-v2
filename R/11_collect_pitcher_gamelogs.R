@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Start-by-start game logs for starting pitchers, 2020-2025
+# Start-by-start game logs for starting pitchers, 2020-current
 # (baseballr::fg_pitcher_game_logs()), keyed by the FanGraphs playerid
 # already captured in R/03_collect_fg_pitching.R. This is what lets
 # features/builder.py compute rolling recent-form features (e.g. ERA over
@@ -14,6 +14,7 @@
 library(baseballr)
 library(dplyr)
 library(readr)
+library(tidyr)
 
 source("R/utils.R")
 
@@ -28,6 +29,25 @@ for (year in YEARS) {
     next
   }
   log_msg("=== %d: fetching SP game logs ===", year)
+
+  game_path <- file.path(RAW_DIR, sprintf("game_logs_%d.csv", year))
+  if (!file.exists(game_path)) {
+    stop(sprintf("%s is required to distinguish starts from relief appearances", game_path))
+  }
+  games <- read_csv(game_path, show_col_types = FALSE)
+  if (!all(c("is_home", "date", "home_starter", "away_starter") %in% names(games))) {
+    stop(sprintf("%s lacks starter identity columns", game_path))
+  }
+  actual_starts <- games %>%
+    filter(is_home == 1) %>%
+    transmute(date = as.character(as.Date(date)), home_starter, away_starter) %>%
+    tidyr::pivot_longer(c(home_starter, away_starter), values_to = "pitcher_name") %>%
+    transmute(
+      date,
+      starter_key = tolower(trimws(strip_accents(pitcher_name)))
+    ) %>%
+    filter(!is.na(starter_key), starter_key != "") %>%
+    distinct(date, starter_key)
 
   fg_path <- file.path(RAW_DIR, sprintf("fg_sp_stats_%d.csv", year))
   if (!file.exists(fg_path)) {
@@ -74,8 +94,12 @@ for (year in YEARS) {
       whip = as.numeric(WHIP)
     ) %>%
     filter(!is.na(pitcher_name), !is.na(date)) %>%
+    mutate(starter_key = tolower(trimws(pitcher_name))) %>%
+    inner_join(actual_starts, by = c("date", "starter_key")) %>%
+    select(-starter_key) %>%
     distinct(fg_playerid, date, .keep_all = TRUE)
 
   write_csv(out, out_path)
-  log_msg("  wrote %s (%d rows)", out_path, nrow(out))
+  log_msg("  wrote %s (%d verified starts; %d relief/non-matching rows removed)",
+          out_path, nrow(out), nrow(combined) - nrow(out))
 }

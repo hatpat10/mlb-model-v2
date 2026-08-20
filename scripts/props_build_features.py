@@ -17,9 +17,12 @@ import pandas as pd
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config.config import PATHS  # noqa: E402
-from features import props_builder  # noqa: E402
+from config.config import PATHS, TRAIN_YEARS  # noqa: E402
+from features import props_builder, builder as moneyline_builder  # noqa: E402
+from features.pitcher_utils import filter_verified_starts  # noqa: E402
 from features.builder import coverage_check  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from artifact_utils import atomic_write_csv, atomic_write_json  # noqa: E402
 
 RAW = PATHS["raw"]
 PROCESSED = PATHS["processed"]
@@ -63,6 +66,8 @@ def main():
     fg_sp = _load_concat("fg_sp_stats_{year}.csv", range(2020, cur + 1))
     statcast_sp = _load_concat("statcast_sp_{year}.csv", range(2020, cur + 1))
     pitcher_gamelogs = _load_concat("pitcher_gamelogs_{year}.csv", range(2020, cur + 1))
+    game_logs_path = RAW / "game_logs_all.csv"
+    game_logs = pd.read_csv(game_logs_path) if game_logs_path.exists() else pd.DataFrame()
 
     player_bio_path = RAW / "player_bio.csv"
     player_bio = pd.read_csv(player_bio_path) if player_bio_path.exists() else pd.DataFrame()
@@ -72,15 +77,13 @@ def main():
         columns=["team", "year", "park_factor"])
 
     umpire_assign_path = RAW / "umpire_assignments.csv"
-    umpire_factors_path = RAW / "umpire_factors.csv"
-    if umpire_assign_path.exists() and umpire_factors_path.exists():
-        assign = pd.read_csv(umpire_assign_path)
-        factors = pd.read_csv(umpire_factors_path)
-        umpire_lookup = assign.merge(factors[["umpire_name", "umpire_run_factor"]], on="umpire_name", how="left")
-        umpire_lookup["game_pk"] = umpire_lookup["game_pk"].astype(str)
+    umpire_game_log_path = RAW / "umpire_game_log.csv"
+    if umpire_assign_path.exists() and umpire_game_log_path.exists():
+        umpire_assignments = pd.read_csv(umpire_assign_path)
+        umpire_game_log = pd.read_csv(umpire_game_log_path)
     else:
-        logger.warning("umpire assignment/factor files not found — umpire_run_factor will be all-NaN")
-        umpire_lookup = pd.DataFrame(columns=["game_pk", "umpire_run_factor"])
+        logger.warning("umpire assignment/game-log files not found — umpire_run_factor will be all-NaN")
+        umpire_assignments = umpire_game_log = pd.DataFrame()
 
     logger.info("Building batter-props features via features/props_builder.py ...")
     df = props_builder.build_batter_rolling_form(batter_gamelogs)
@@ -103,6 +106,9 @@ def main():
         logger.warning("fg_sp_stats data unavailable — skipping join_opposing_pitcher_stats")
 
     if not pitcher_gamelogs.empty:
+        if game_logs.empty:
+            raise FileNotFoundError("game_logs_all.csv is required to verify starter-only pitcher appearances")
+        pitcher_gamelogs = filter_verified_starts(pitcher_gamelogs, game_logs)
         df = props_builder.join_opposing_pitcher_rolling(df, pitcher_gamelogs)
     else:
         logger.warning("pitcher_gamelogs data unavailable — skipping join_opposing_pitcher_rolling")
@@ -112,8 +118,8 @@ def main():
     else:
         logger.warning("park_factors data unavailable — skipping join_park_factors")
 
-    if not umpire_lookup.empty:
-        df = props_builder.join_umpires(df, umpire_lookup)
+    if not umpire_assignments.empty and not umpire_game_log.empty:
+        df = moneyline_builder.join_umpires(df, umpire_assignments, umpire_game_log)
     else:
         df["umpire_run_factor"] = pd.NA
 
@@ -127,21 +133,22 @@ def main():
     # so this bar only needs to catch genuinely broken/sparse columns, not
     # penalize real, expected missingness.
     feature_cols = [c for c in props_builder.BATTER_FEATURE_COLS if c in df.columns]
-    train_years = [y for y in range(2021, cur) if y <= 2025]
-    passing_cols = coverage_check(df, feature_cols, min_coverage=0.75, train_years=train_years)
+    passing_cols = coverage_check(
+        df, feature_cols, min_coverage=0.75, train_years=TRAIN_YEARS,
+        coverage_overrides={"park_factor": 0.60},
+    )
 
     PROCESSED.mkdir(parents=True, exist_ok=True)
     out_path = PROCESSED / "props_feature_matrix.csv"
-    df.to_csv(out_path, index=False)
+    atomic_write_csv(df, out_path)
     logger.info(f"Wrote {out_path} ({len(df)} rows, {len(df.columns)} columns)")
 
     names_path = PROCESSED / "props_feature_names.json"
-    with open(names_path, "w") as f:
-        json.dump({
-            "all_candidate_features": feature_cols,
-            "passing_features": passing_cols,
-            "label_cols": props_builder.BATTER_LABEL_COLS,
-        }, f, indent=2)
+    atomic_write_json({
+        "all_candidate_features": feature_cols,
+        "passing_features": passing_cols,
+        "label_cols": props_builder.BATTER_LABEL_COLS,
+    }, names_path)
     logger.info(f"Wrote {names_path} ({len(passing_cols)}/{len(feature_cols)} features passed coverage_check)")
 
 

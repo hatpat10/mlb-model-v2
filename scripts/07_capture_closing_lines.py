@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config.config import PATHS  # noqa: E402
 from odds_utils import aggregate_h2h_event, fetch_slate, MIN_BOOKMAKERS  # noqa: E402
+from artifact_utils import atomic_write_csv  # noqa: E402
 
 RAW = PATHS["raw"]
 LOGS = PATHS["logs"]
@@ -90,7 +91,7 @@ def match_events_to_slate(events: list, slate: pd.DataFrame, date: str) -> dict:
     the same event. Returns {game_pk: aggregated-odds dict}.
     """
     candidates = []
-    for event in events:
+    for event_index, event in enumerate(events):
         commence_raw = event.get("commence_time")
         if not commence_raw:
             continue
@@ -106,16 +107,18 @@ def match_events_to_slate(events: list, slate: pd.DataFrame, date: str) -> dict:
         agg = aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS)
         if agg is None:
             continue
+        event_key = event.get("id") or f"event_{event_index}"
         for _, m in matches.iterrows():
             gap = abs((m["start_utc"] - commence).total_seconds())
-            candidates.append((gap, m["game_pk"], agg))
+            candidates.append((gap, m["game_pk"], event_key, {**agg, "odds_event_id": event.get("id")}))
 
     matched = {}
-    used_pks = set()
-    for gap, game_pk, agg in sorted(candidates, key=lambda c: c[0]):
-        if game_pk in used_pks:
+    used_pks, used_events = set(), set()
+    for gap, game_pk, event_key, agg in sorted(candidates, key=lambda c: c[0]):
+        if game_pk in used_pks or event_key in used_events:
             continue
         used_pks.add(game_pk)
+        used_events.add(event_key)
         matched[game_pk] = agg
     return matched
 
@@ -151,6 +154,10 @@ def write_snapshot(date: str, slate: pd.DataFrame, matched: dict, now_utc: datet
             "commence_time_utc": g["start_utc"].isoformat(),
             "snapshot_time_utc": now_utc.isoformat(),
             "n_books": agg["n_books"],
+            "odds_event_id": agg.get("odds_event_id"),
+            "bookmaker_key": agg.get("bookmaker_key"),
+            "bookmaker_title": agg.get("bookmaker_title"),
+            "bookmaker_last_update": agg.get("bookmaker_last_update"),
             "home_ml_close": agg["home_ml"],
             "away_ml_close": agg["away_ml"],
             "home_no_vig_prob": agg["no_vig_home_implied"],
@@ -163,11 +170,11 @@ def write_snapshot(date: str, slate: pd.DataFrame, matched: dict, now_utc: datet
     kept = existing[~existing["game_pk"].isin(new_rows)] if not existing.empty else pd.DataFrame()
     out = pd.concat([kept, pd.DataFrame(list(new_rows.values()))], ignore_index=True)
     out = out.sort_values("commence_time_utc").reset_index(drop=True)
-    out.to_csv(path, index=False)
+    atomic_write_csv(out, path)
     return updated
 
 
-def run_pregame_predict(date: str):
+def run_pregame_predict(date: str, game_pks: list[str]) -> bool:
     """Re-run 04_predict.py, and only proceed to bankroll bet-logging if it
     actually succeeded and produced a FRESH predictions_<date>.csv this
     invocation. Without this gate, a failed or hung predict (check=False,
@@ -181,19 +188,26 @@ def run_pregame_predict(date: str):
     if result.returncode != 0:
         logger.error(f"04_predict.py exited {result.returncode} — skipping bet-logging to avoid "
                       "staking on a stale/missing prediction.")
-        return
+        return False
 
     pred_path = OUTPUTS / f"predictions_{date}.csv"
     if not pred_path.exists():
         logger.error(f"{pred_path.name} does not exist after a successful predict run — skipping bet-logging.")
-        return
+        return False
     written_at = datetime.fromtimestamp(pred_path.stat().st_mtime, tz=timezone.utc)
     if written_at < invoked_at:
         logger.error(f"{pred_path.name} was not refreshed by this run (last written {written_at:%H:%M UTC}, "
                       f"before this invocation started at {invoked_at:%H:%M UTC}) — skipping bet-logging.")
-        return
+        return False
 
-    subprocess.run([str(PYTHON), "scripts/05_bankroll.py", "--date", date, "--log-bets"], cwd=str(ROOT), check=False)
+    log_result = subprocess.run([
+        str(PYTHON), "scripts/05_bankroll.py", "--date", date, "--log-bets",
+        "--game-pks", ",".join(game_pks),
+    ], cwd=str(ROOT))
+    if log_result.returncode != 0:
+        logger.error(f"05_bankroll.py exited {log_result.returncode} for game cluster {game_pks}.")
+        return False
+    return True
 
 
 def main():
@@ -219,31 +233,39 @@ def main():
     logger.info(f"{len(slate)} games on the {date} slate, "
                 f"{slate['start_utc'].nunique()} distinct start times.")
 
+    failures = []
+
     def snapshot(label: str):
         now_utc = datetime.now(timezone.utc)
         try:
             events = fetch_odds_events(api_key)
         except requests.RequestException as e:
             logger.warning(f"[{label}] odds fetch failed: {e}")
-            return
+            failures.append(f"odds:{label}")
+            return False
         matched = match_events_to_slate(events, slate, date)
         n = write_snapshot(date, slate, matched, now_utc)
         logger.info(f"[{label}] snapshot: odds for {len(matched)}/{len(slate)} games, "
                     f"{n} not-yet-started rows updated -> {out_path_for(date).name}")
+        if len(matched) == 0:
+            failures.append(f"no_matches:{label}")
+            return False
+        return True
 
     if args.once:
-        snapshot("once")
+        if not snapshot("once"):
+            sys.exit(1)
         return
 
     # Wake plan: one baseline snapshot now, then one wake per distinct start
     # time (5 min before it), plus the optional pre-game re-predict wake.
     now = datetime.now(timezone.utc)
-    wakes = []  # (when_utc, kind)
+    wakes = []  # (when_utc, kind, game_pks)
     for start in sorted(slate["start_utc"].unique()):
         start = pd.Timestamp(start).to_pydatetime()
         wake_at = start - SNAPSHOT_LEAD
         if wake_at > now:
-            wakes.append((wake_at, "close"))
+            wakes.append((wake_at, "close", []))
         else:
             logger.warning(f"Start time {start:%H:%M UTC} already within {SNAPSHOT_LEAD} — "
                            f"baseline snapshot will serve as its closing line.")
@@ -255,18 +277,23 @@ def main():
         # with several distinct start times).
         for start in sorted(slate["start_utc"].unique()):
             start = pd.Timestamp(start).to_pydatetime()
+            cluster_pks = slate.loc[pd.to_datetime(slate["start_utc"], utc=True) == pd.Timestamp(start), "game_pk"].astype(str).tolist()
             predict_at = start - PREGAME_PREDICT_LEAD
             if predict_at > now:
-                wakes.append((predict_at, "predict"))
+                wakes.append((predict_at, "predict", cluster_pks))
             else:
-                logger.warning(f"Start time {start:%H:%M UTC} is less than {PREGAME_PREDICT_LEAD} away — "
-                               "skipping its pre-game re-predict wake.")
+                if now < start:
+                    logger.warning(f"Start time {start:%H:%M UTC} is inside the normal lead window — "
+                                   "running its pre-game decision immediately.")
+                    wakes.append((now, "predict", cluster_pks))
+                else:
+                    logger.warning(f"Start time {start:%H:%M UTC} has passed — no new decision will be logged.")
     wakes.sort(key=lambda w: w[0])
 
     snapshot("baseline")
 
     deadline = now + timedelta(hours=MAX_RUNTIME_HOURS)
-    for wake_at, kind in wakes:
+    for wake_at, kind, game_pks in wakes:
         wait = (wake_at - datetime.now(timezone.utc)).total_seconds()
         if wait > 0:
             if wake_at > deadline:
@@ -275,7 +302,8 @@ def main():
             logger.info(f"Sleeping {wait/60:.0f} min until {wake_at:%H:%M UTC} ({kind}) ...")
             time.sleep(wait)
         if kind == "predict":
-            run_pregame_predict(date)
+            if not run_pregame_predict(date, game_pks):
+                failures.append(f"predict:{','.join(game_pks)}")
         else:
             snapshot(f"close@{wake_at:%H:%M}")
 
@@ -284,8 +312,19 @@ def main():
         final = pd.read_csv(path)
         logger.info(f"Done: {len(final)}/{len(slate)} games captured in {path.name}. "
                     f"CLV will populate on the next 05_bankroll.py --settle.")
+        if len(final) < len(slate):
+            failures.append(f"incomplete_closing_coverage:{len(final)}/{len(slate)}")
     else:
         logger.warning(f"Done, but no odds were ever captured for {date}.")
+        failures.append("no_closing_file")
+    critical = [failure for failure in failures if failure.startswith(("predict:", "incomplete_closing_coverage:", "odds:close@", "no_matches:close@"))
+                or failure == "no_closing_file"]
+    recovered = [failure for failure in failures if failure not in critical]
+    if recovered:
+        logger.warning(f"Transient snapshot failures recovered before completion: {recovered}")
+    if critical:
+        logger.error(f"Closing-line watcher completed with critical failures: {critical}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

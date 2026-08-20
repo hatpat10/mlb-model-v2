@@ -108,18 +108,23 @@ def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
             p_home = american_to_implied_prob(home_price)
             p_away = american_to_implied_prob(away_price)
             book_no_vig_home.append(float(p_home / (p_home + p_away)))
-            book_prices.append((home_price, away_price))
+            book_prices.append({
+                "home_ml": home_price,
+                "away_ml": away_price,
+                "bookmaker_key": book.get("key"),
+                "bookmaker_title": book.get("title"),
+                "bookmaker_last_update": market.get("last_update") or book.get("last_update"),
+            })
 
     if len(book_no_vig_home) < min_bookmakers:
         return None
 
     no_vig_home_implied = float(np.median(book_no_vig_home))
     closest_idx = int(np.argmin(np.abs(np.array(book_no_vig_home) - no_vig_home_implied)))
-    home_ml, away_ml = book_prices[closest_idx]
+    representative = book_prices[closest_idx]
 
     return {
         "no_vig_home_implied": no_vig_home_implied,
-        "home_ml": home_ml,
-        "away_ml": away_ml,
+        **representative,
         "n_books": len(book_no_vig_home),
     }
