@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Daily prediction pipeline: fetch today's schedule + probable starters
 from the MLB Stats API, build features via features/builder.py (the same
-functions used in training), score with the calibrated XGB+LGBM average,
+functions used in training), score with the manifest-selected calibrated model,
 pull moneyline odds from The Odds API, and flag edges against the
 no-vig market-implied probability.
 
@@ -30,10 +30,10 @@ from config.config import (  # noqa: E402
     REQUIRE_POSTED_LINEUPS_FOR_BET, REQUIRE_UMPIRE_FOR_BET, BETTING_EXECUTION_MODE,
     BETTING_BOOKMAKERS,
 )
-from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from odds_utils import aggregate_h2h_event  # noqa: E402
 from artifact_utils import atomic_write_csv, make_run_id, sha256_file, utc_now_iso  # noqa: E402
 from model_registry import resolve_production_model_dir  # noqa: E402
+from model_scoring import score_probability_bundle  # noqa: E402
 from decision_log import append_decisions  # noqa: E402
 from features import builder  # noqa: E402
 from features.pitcher_utils import filter_verified_starts  # noqa: E402
@@ -359,8 +359,6 @@ def main():
     with open(model_dir / "feature_names.json") as f:
         features = json.load(f)["passing_features"]
     medians = joblib.load(model_dir / "train_medians.joblib")
-    xgb_cal = joblib.load(model_dir / "xgb_calibrated.joblib")
-    lgbm_cal = joblib.load(model_dir / "lgbm_calibrated.joblib")
 
     game_df, _ = builder.pivot_to_game_level(today_long)
 
@@ -369,12 +367,12 @@ def main():
             game_df[col] = np.nan
     X_today = game_df[features].fillna(medians)
 
-    xgb_home_prob = xgb_cal.predict_proba(X_today)[:, 1]
-    lgbm_home_prob = lgbm_cal.predict_proba(X_today)[:, 1]
-    game_df["xgb_home_win_prob"] = xgb_home_prob
-    game_df["lgbm_home_win_prob"] = lgbm_home_prob
-    game_df["model_disagreement"] = np.abs(xgb_home_prob - lgbm_home_prob)
-    game_df["home_win_prob"] = (xgb_home_prob + lgbm_home_prob) / 2.0
+    probability = score_probability_bundle(model_dir, X_today, manifest=model_manifest)
+    game_df["xgb_home_win_prob"] = probability["xgb_home_probability"]
+    game_df["lgbm_home_win_prob"] = probability["lgbm_home_probability"]
+    game_df["model_disagreement"] = probability["model_disagreement"]
+    game_df["home_win_prob"] = probability["home_probability"]
+    game_df["prediction_model_type"] = probability["prediction_model_type"]
 
     # game_df only carries team abbreviations, but the odds feed matches on
     # full team names, so bring those in from the original schedule payload first.

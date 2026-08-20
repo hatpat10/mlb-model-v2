@@ -221,7 +221,7 @@ def production_model_is_current():
         model_manifest.get("training_years") == PRODUCTION_TRAIN_YEARS
         and model_manifest.get("production_feature_version") == feature_manifest.get("production_feature_version")
         and model_manifest.get("schema_version") == PRODUCTION_MODEL_SCHEMA_VERSION
-        and model_manifest.get("validation_scheme") == "expanding_season_rolling_origin"
+        and model_manifest.get("validation_scheme") == "untouched_next_season_after_prior_season_tuning"
     )
 
 

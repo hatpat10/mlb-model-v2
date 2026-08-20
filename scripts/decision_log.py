@@ -18,7 +18,7 @@ DECISION_LOG_COLUMNS = [
     "market_available", "n_books", "n_executable_books", "book_prob_std", "book_prob_range",
     "home_bookmaker_key", "home_bookmaker_title", "away_bookmaker_key",
     "away_bookmaker_title", "price_selection_method", "price_universe", "odds_event_id",
-    "odds_snapshot_utc", "model_version", "model_mode", "data_version",
+    "odds_snapshot_utc", "model_version", "model_mode", "prediction_model_type", "data_version",
     "feature_build_id", "model_training_data_version", "model_feature_build_id",
     "execution_mode",
 ]

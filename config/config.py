@@ -63,7 +63,7 @@ ALL_DATA_YEARS = list(range(2020, CURRENT_YEAR + 1))
 PRODUCTION_TRAIN_YEARS = list(range(2021, CURRENT_YEAR))
 PRODUCTION_CALIBRATION_YEARS = PRODUCTION_TRAIN_YEARS[-2:]
 PRODUCTION_OPTUNA_TRIALS = 30
-PRODUCTION_MODEL_SCHEMA_VERSION = 2
+PRODUCTION_MODEL_SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------
 # Standard 30-team abbreviation set

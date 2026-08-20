@@ -37,6 +37,7 @@ from config.config import (  # noqa: E402
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from artifact_utils import atomic_write_json, make_run_id, sha256_file, utc_now_iso  # noqa: E402
 from model_registry import publish_production_model  # noqa: E402
+from model_scoring import prediction_model_type  # noqa: E402
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -234,6 +235,86 @@ def expected_calibration_error(y_true, y_prob, n_bins=10):
     return ece
 
 
+def probability_metrics(y_true, y_prob):
+    """Return the probability metrics used for model selection and reporting."""
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = np.asarray(y_prob, dtype=float)
+    return {
+        "auc": float(roc_auc_score(y_true, y_prob)),
+        "accuracy": float(accuracy_score(y_true, (y_prob >= 0.5).astype(int))),
+        "brier": float(brier_score_loss(y_true, y_prob)),
+        "ece": float(expected_calibration_error(y_true, y_prob)),
+    }
+
+
+def derive_auc_weights(oof, y_true, eligible_mask=None):
+    """Derive non-negative ensemble weights from eligible OOF rows only."""
+    y_true = np.asarray(y_true, dtype=int)
+    eligible = np.ones(len(y_true), dtype=bool) if eligible_mask is None else np.asarray(eligible_mask, dtype=bool)
+    weights = {}
+    for name, predictions in oof.items():
+        valid = eligible & np.isfinite(predictions)
+        auc = roc_auc_score(y_true[valid], predictions[valid]) if valid.sum() and np.unique(y_true[valid]).size > 1 else 0.5
+        weights[name] = max(float(auc) - 0.5, 0.0)
+    if sum(weights.values()) == 0:
+        weights = {name: 1.0 for name in oof}
+    return weights
+
+
+def weighted_oof_probability(oof, weights):
+    """Combine OOF vectors, retaining NaN where any weighted component is absent."""
+    active = [name for name, weight in weights.items() if weight > 0]
+    if not active:
+        raise ValueError("At least one positive ensemble weight is required")
+    combined = np.zeros(len(next(iter(oof.values()))), dtype=float)
+    valid = np.ones(len(combined), dtype=bool)
+    for name in active:
+        predictions = np.asarray(oof[name], dtype=float)
+        combined += predictions * weights[name]
+        valid &= np.isfinite(predictions)
+    combined /= sum(weights[name] for name in active)
+    combined[~valid] = np.nan
+    return combined
+
+
+def prior_calibration_years(years, evaluation_year, n_years=2):
+    """Pick the latest OOF seasons strictly before an untouched evaluation year."""
+    prior = sorted({int(year) for year in np.asarray(years) if int(year) < int(evaluation_year)})
+    if len(prior) < n_years:
+        raise ValueError(f"Need at least {n_years} seasons before evaluation year {evaluation_year}")
+    return prior[-n_years:]
+
+
+def fit_isotonic_and_apply(raw_probability, y_true, fit_mask, apply_mask):
+    raw_probability = np.asarray(raw_probability, dtype=float)
+    y_true = np.asarray(y_true, dtype=int)
+    fit_mask = np.asarray(fit_mask, dtype=bool) & np.isfinite(raw_probability)
+    apply_mask = np.asarray(apply_mask, dtype=bool) & np.isfinite(raw_probability)
+    if fit_mask.sum() < 2 or np.unique(y_true[fit_mask]).size < 2:
+        raise ValueError("Isotonic calibration requires two classes in prior-season OOF rows")
+    calibrator = IsotonicRegression(out_of_bounds="clip")
+    calibrator.fit(raw_probability[fit_mask], y_true[fit_mask])
+    return np.clip(calibrator.predict(raw_probability[apply_mask]), 1e-6, 1 - 1e-6), calibrator
+
+
+def choose_prediction_candidate(candidate_metrics, auc_tolerance=0.002):
+    """Choose best Brier score among candidates near the best observed AUC."""
+    best_auc = max(metrics["auc"] for metrics in candidate_metrics.values())
+    eligible = {
+        artifact: metrics for artifact, metrics in candidate_metrics.items()
+        if metrics["auc"] >= best_auc - auc_tolerance
+    }
+    return min(
+        eligible,
+        key=lambda artifact: (
+            eligible[artifact]["brier"],
+            -eligible[artifact]["accuracy"],
+            eligible[artifact]["ece"],
+            artifact,
+        ),
+    )
+
+
 def main():
     global N_OPTUNA_TRIALS
     parser = argparse.ArgumentParser()
@@ -260,21 +341,35 @@ def main():
     # Raw feature rows are passed to that CV path so each fold's missing-value
     # medians are learned only from its strictly-prior training seasons.
     if args.mode == "benchmark":
-        tscv = TimeSeriesSplit(n_splits=N_SPLITS)
-        X_cv = X_train
+        tuning_splitter = TimeSeriesSplit(n_splits=N_SPLITS)
+        oof_splitter = tuning_splitter
+        X_tune = X_train
+        y_tune = y_train
+        X_oof = X_train
         validation_scheme = f"row_time_series_{N_SPLITS}_fold"
     else:
-        tscv = ExpandingYearSplit(train_df["year"].values)
-        X_cv = train_df[features]
-        validation_scheme = "expanding_season_rolling_origin"
-    logger.info(f"Validation scheme: {validation_scheme} ({tscv.get_n_splits()} folds)")
+        # Hyperparameters must not see the final reporting season. They are
+        # selected on expanding folds through eval_year - 1; a separate OOF
+        # pass then produces a genuinely untouched eval_year prediction from
+        # a model trained only on earlier seasons.
+        tuning_mask = train_df["year"].lt(eval_year)
+        X_tune = train_df.loc[tuning_mask, features].reset_index(drop=True)
+        y_tune = y_train.loc[tuning_mask].reset_index(drop=True)
+        tuning_splitter = ExpandingYearSplit(train_df.loc[tuning_mask, "year"].values)
+        X_oof = train_df[features]
+        oof_splitter = ExpandingYearSplit(train_df["year"].values)
+        validation_scheme = "untouched_next_season_after_prior_season_tuning"
+    logger.info(
+        f"Validation scheme: {validation_scheme} "
+        f"({tuning_splitter.get_n_splits()} tuning folds; {oof_splitter.get_n_splits()} OOF folds)"
+    )
 
     logger.info("Tuning LogisticRegression ...")
-    lr_params = tune_logreg(X_cv, y_train, tscv)
+    lr_params = tune_logreg(X_tune, y_tune, tuning_splitter)
     logger.info("Tuning XGBoost (Optuna, {} trials) ...".format(N_OPTUNA_TRIALS))
-    xgb_params = tune_xgb(X_cv, y_train, tscv)
+    xgb_params = tune_xgb(X_tune, y_tune, tuning_splitter)
     logger.info("Tuning LightGBM (Optuna, {} trials) ...".format(N_OPTUNA_TRIALS))
-    lgbm_params = tune_lgbm(X_cv, y_train, tscv)
+    lgbm_params = tune_lgbm(X_tune, y_tune, tuning_splitter)
     rf_params = {"n_estimators": 300, "max_depth": 6, "min_samples_leaf": 5}
 
     model_specs = {
@@ -284,23 +379,23 @@ def main():
         "rf": ("rf", rf_params),
     }
 
-    logger.info(f"Running shared {tscv.get_n_splits()}-fold OOF pass for ensemble weights + calibration fitting ...")
-    oof = oof_predictions(model_specs, X_cv, y_train, tscv)
+    logger.info(f"Running shared {oof_splitter.get_n_splits()}-fold OOF pass for ensemble weights + calibration fitting ...")
+    oof = oof_predictions(model_specs, X_oof, y_train, oof_splitter)
 
-    weights = {}
+    weights = derive_auc_weights(oof, y_train.values)
     for name, preds in oof.items():
         mask = ~np.isnan(preds)
         auc = roc_auc_score(y_train[mask], preds[mask]) if mask.sum() > 0 else 0.5
-        weights[name] = max(auc - 0.5, 0.0)
         logger.info(f"  {name}: OOF AUC={auc:.4f}, weight={weights[name]:.4f}")
-    if sum(weights.values()) == 0:
-        weights = {name: 1.0 for name in model_specs}
     logger.info(f"Ensemble weights (CV-derived, no test-set leakage): {weights}")
 
     logger.info("Fitting final models on full training set ...")
     final_models = {name: make_model(factory, params) for name, (factory, params) in model_specs.items()}
     for name, model in final_models.items():
         model.fit(X_train, y_train)
+    if args.mode == "production":
+        for name in ("xgb", "lgbm"):
+            joblib.dump(final_models[name], artifact_dir / f"{name}.joblib")
 
     ensemble = WeightedEnsembleClassifier(models=final_models, weights=weights)
     joblib.dump(ensemble, artifact_dir / "ensemble.joblib")
@@ -321,13 +416,28 @@ def main():
         joblib.dump(calibrated, artifact_dir / f"{name}_calibrated.joblib")
         logger.info(f"Saved {artifact_dir / f'{name}_calibrated.joblib'} ({valid.sum()} calibration points)")
 
+    ensemble_oof = weighted_oof_probability(oof, weights)
+    if args.mode == "production":
+        ensemble_valid = calib_mask & np.isfinite(ensemble_oof)
+        ensemble_iso = IsotonicRegression(out_of_bounds="clip")
+        ensemble_iso.fit(ensemble_oof[ensemble_valid], y_train.values[ensemble_valid])
+        calibrated_ensemble = PreFitCalibratedClassifier(base_estimator=ensemble, calibrator=ensemble_iso)
+        joblib.dump(calibrated_ensemble, artifact_dir / "ensemble_calibrated.joblib")
+        logger.info(
+            f"Saved {artifact_dir / 'ensemble_calibrated.joblib'} "
+            f"({ensemble_valid.sum()} calibration points)"
+        )
+
     with open(PROCESSED / "feature_names.json") as f:
         names_blob = json.load(f)
     with open(artifact_dir / "feature_names.json", "w") as f:
         json.dump(names_blob, f, indent=2)
 
-    evaluation_label = f"{eval_year} HOLDOUT" if args.mode == "benchmark" else f"{eval_year} ROLLING-ORIGIN VALIDATION"
+    evaluation_label = f"{eval_year} HOLDOUT" if args.mode == "benchmark" else f"{eval_year} UNTOUCHED NEXT-SEASON VALIDATION"
     logger.info(f"========== {evaluation_label} ==========")
+    prediction_artifact = "xgb_lgbm_calibrated_average"
+    promoted_model_type = "calibrated_xgb_lgbm_average"
+    selection = None
     if args.mode == "benchmark":
         xgb_eval_proba = calibrated_models["xgb"].predict_proba(X_test)[:, 1]
         lgbm_eval_proba = calibrated_models["lgbm"].predict_proba(X_test)[:, 1]
@@ -337,40 +447,88 @@ def main():
         evaluation_series = [
             ("calibrated XGB", xgb_eval_proba),
             ("calibrated LGBM", lgbm_eval_proba),
-            ("avg(calibrated XGB, calibrated LGBM) [used by 04_predict.py]", average_eval_proba),
+            ("avg(calibrated XGB, calibrated LGBM)", average_eval_proba),
             ("uncalibrated weighted ensemble", ensemble_eval_proba),
         ]
+        selected_eval_proba = average_eval_proba
     else:
+        years = train_df["year"].astype(int).values
         eval_mask = train_df["year"].eq(eval_year).values
-        valid_eval = eval_mask & ~np.isnan(oof["xgb"]) & ~np.isnan(oof["lgbm"])
+        prior_mask = years < eval_year
+        selection_calibration_years = prior_calibration_years(years, eval_year)
+        selection_calibration_mask = np.isin(years, selection_calibration_years)
+        prior_weights = derive_auc_weights(oof, y_train.values, prior_mask)
+        prior_ensemble_oof = weighted_oof_probability(oof, prior_weights)
+        valid_eval = (
+            eval_mask & np.isfinite(oof["xgb"]) & np.isfinite(oof["lgbm"])
+            & np.isfinite(prior_ensemble_oof)
+        )
         y_eval = y_train.values[valid_eval]
         xgb_eval_proba = oof["xgb"][valid_eval]
         lgbm_eval_proba = oof["lgbm"][valid_eval]
-        average_eval_proba = (xgb_eval_proba + lgbm_eval_proba) / 2.0
-        weighted_sum = sum(oof[name][valid_eval] * weights[name] for name in model_specs)
-        ensemble_eval_proba = weighted_sum / sum(weights.values())
+        xgb_calibrated_eval, _ = fit_isotonic_and_apply(
+            oof["xgb"], y_train.values, selection_calibration_mask, valid_eval,
+        )
+        lgbm_calibrated_eval, _ = fit_isotonic_and_apply(
+            oof["lgbm"], y_train.values, selection_calibration_mask, valid_eval,
+        )
+        average_eval_proba = (xgb_calibrated_eval + lgbm_calibrated_eval) / 2.0
+        ensemble_eval_proba, _ = fit_isotonic_and_apply(
+            prior_ensemble_oof, y_train.values, selection_calibration_mask, valid_eval,
+        )
+        raw_average_eval_proba = (xgb_eval_proba + lgbm_eval_proba) / 2.0
+        raw_ensemble_eval_proba = prior_ensemble_oof[valid_eval]
+        candidate_probabilities = {
+            "xgb.joblib": xgb_eval_proba,
+            "lgbm.joblib": lgbm_eval_proba,
+            "xgb_lgbm_raw_average": raw_average_eval_proba,
+            "ensemble.joblib": raw_ensemble_eval_proba,
+            "xgb_lgbm_calibrated_average": average_eval_proba,
+            "ensemble_calibrated.joblib": ensemble_eval_proba,
+        }
+        candidate_metrics = {
+            artifact: probability_metrics(y_eval, probability)
+            for artifact, probability in candidate_probabilities.items()
+        }
+        prediction_artifact = choose_prediction_candidate(candidate_metrics)
+        promoted_model_type = prediction_model_type(prediction_artifact)
+        selected_eval_proba = candidate_probabilities[prediction_artifact]
+        selection = {
+            "primary_metric": "brier",
+            "auc_regression_tolerance": 0.002,
+            "evaluation_year": int(eval_year),
+            "calibration_years": selection_calibration_years,
+            "ensemble_weights_derived_through_year": int(eval_year - 1),
+            "ensemble_weights": prior_weights,
+            "candidates": candidate_metrics,
+            "winner": prediction_artifact,
+        }
+        logger.info(
+            f"Promoted probability artifact: {prediction_artifact} "
+            f"(selection calibration years {selection_calibration_years})"
+        )
         evaluation_series = [
             ("rolling-origin XGB (uncalibrated)", xgb_eval_proba),
             ("rolling-origin LGBM (uncalibrated)", lgbm_eval_proba),
-            ("rolling-origin avg(XGB, LGBM)", average_eval_proba),
-            ("rolling-origin weighted ensemble", ensemble_eval_proba),
+            ("rolling-origin raw XGB/LGBM average", raw_average_eval_proba),
+            ("rolling-origin raw weighted ensemble", raw_ensemble_eval_proba),
+            ("prior-season calibrated XGB/LGBM average", average_eval_proba),
+            ("prior-season calibrated weighted ensemble", ensemble_eval_proba),
         ]
 
     evaluation_metrics = {}
     for label, proba in evaluation_series:
-        auc = roc_auc_score(y_eval, proba)
-        acc = accuracy_score(y_eval, (proba >= 0.5).astype(int))
-        brier = brier_score_loss(y_eval, proba)
-        ece = expected_calibration_error(y_eval, proba)
-        evaluation_metrics[label] = {
-            "auc": float(auc), "accuracy": float(acc), "brier": float(brier), "ece": float(ece),
-        }
-        logger.info(f"{label}: AUC={auc:.4f}  Acc={acc:.4f}  Brier={brier:.4f}  ECE={ece:.4f}")
+        metrics = probability_metrics(y_eval, proba)
+        evaluation_metrics[label] = metrics
+        logger.info(
+            f"{label}: AUC={metrics['auc']:.4f}  Acc={metrics['accuracy']:.4f}  "
+            f"Brier={metrics['brier']:.4f}  ECE={metrics['ece']:.4f}"
+        )
 
-    frac_pos, mean_pred = calibration_curve(y_eval, average_eval_proba, n_bins=10)
+    frac_pos, mean_pred = calibration_curve(y_eval, selected_eval_proba, n_bins=10)
     plt.figure(figsize=(6, 6))
     plt.plot([0, 1], [0, 1], "k--", label="Perfectly calibrated")
-    curve_label = "avg(calibrated XGB, LGBM)" if args.mode == "benchmark" else "rolling-origin avg(XGB, LGBM)"
+    curve_label = promoted_model_type.replace("_", " ")
     plt.plot(mean_pred, frac_pos, marker="o", label=curve_label)
     plt.xlabel("Mean predicted probability")
     plt.ylabel("Fraction of actual home wins")
@@ -387,6 +545,8 @@ def main():
         with open(feature_manifest_path, encoding="utf-8") as handle:
             feature_manifest = json.load(handle)
     model_files = ["train_medians.joblib", "ensemble.joblib", "xgb_calibrated.joblib", "lgbm_calibrated.joblib", "feature_names.json"]
+    if args.mode == "production":
+        model_files.extend(["xgb.joblib", "lgbm.joblib", "ensemble_calibrated.joblib"])
     manifest = {
         "schema_version": 1 if args.mode == "benchmark" else PRODUCTION_MODEL_SCHEMA_VERSION,
         "model_version": model_version,
@@ -397,6 +557,9 @@ def main():
         "evaluation_year": eval_year,
         "validation_scheme": validation_scheme,
         "validation_metrics": evaluation_metrics,
+        "prediction_artifact": prediction_artifact,
+        "prediction_model_type": promoted_model_type,
+        "model_selection": selection,
         "optuna_trials": N_OPTUNA_TRIALS,
         "feature_build_id": feature_manifest.get("build_id"),
         "data_version": feature_manifest.get("data_version"),

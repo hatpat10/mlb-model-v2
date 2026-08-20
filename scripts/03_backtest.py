@@ -22,11 +22,11 @@ from config.config import (  # noqa: E402
     PATHS, TEST_YEAR, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE,
     MIN_STRATEGY_VALIDATION_BETS, MIN_STRATEGY_VALIDATION_COVERAGE,
 )
-from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from odds_utils import american_to_decimal_odds  # noqa: E402
 from betting_strategy import american_to_decimal, size_stake  # noqa: E402
 from artifact_utils import atomic_write_json  # noqa: E402
 from model_registry import resolve_production_model_dir  # noqa: E402
+from model_scoring import load_model_manifest, score_probability_bundle  # noqa: E402
 from performance_metrics import date_block_roi_ci  # noqa: E402
 
 RAW = PATHS["raw"]
@@ -44,21 +44,20 @@ def load_scored_rows(model_dir=MODELS, start_year=TEST_YEAR):
     with open(model_dir / "feature_names.json") as f:
         features = json.load(f)["passing_features"]
     medians = joblib.load(model_dir / "train_medians.joblib")
-    xgb_cal = joblib.load(model_dir / "xgb_calibrated.joblib")
-    lgbm_cal = joblib.load(model_dir / "lgbm_calibrated.joblib")
 
     df = pd.read_csv(PROCESSED / "feature_matrix.csv")
     scored = df[df["year"] >= start_year].reset_index(drop=True)
     X_test = scored[features].fillna(medians)
 
-    xgb_prob = xgb_cal.predict_proba(X_test)[:, 1]
-    lgbm_prob = lgbm_cal.predict_proba(X_test)[:, 1]
-    home_prob = (xgb_prob + lgbm_prob) / 2.0
+    probability = score_probability_bundle(
+        model_dir, X_test, manifest=load_model_manifest(model_dir),
+    )
     scored = scored.copy()
-    scored["xgb_home_prob"] = xgb_prob
-    scored["lgbm_home_prob"] = lgbm_prob
-    scored["model_disagreement"] = np.abs(xgb_prob - lgbm_prob)
-    scored["model_home_prob"] = home_prob
+    scored["xgb_home_prob"] = probability["xgb_home_probability"]
+    scored["lgbm_home_prob"] = probability["lgbm_home_probability"]
+    scored["model_disagreement"] = probability["model_disagreement"]
+    scored["model_home_prob"] = probability["home_probability"]
+    scored["prediction_model_type"] = probability["prediction_model_type"]
     return scored
 
 
@@ -243,6 +242,7 @@ def main():
             "This is a close-time retrospective, not evidence of prices available at the live T-2h decision."
         ),
         "auc": auc, "accuracy": acc, "brier": brier,
+        "prediction_model_type": test_df["prediction_model_type"].iloc[0] if not test_df.empty else None,
         "model_disagreement": disagreement_diagnostics(test_df),
     }
 
@@ -290,7 +290,10 @@ def main():
         production_scored = load_scored_rows(production_dir, production_start)
         if not production_scored.empty:
             pa, pc, pb = evaluate_accuracy(production_scored, f"production {production_start}+ out-of-sample")
-            results["production_accuracy"] = {"auc": pa, "accuracy": pc, "brier": pb}
+            results["production_accuracy"] = {
+                "auc": pa, "accuracy": pc, "brier": pb,
+                "prediction_model_type": production_scored["prediction_model_type"].iloc[0],
+            }
             results["production_model_disagreement"] = disagreement_diagnostics(production_scored)
             production_scored["game_pk"] = production_scored["game_pk"].astype(str)
             production_odds = real_odds.drop_duplicates("game_pk", keep="last").drop(
@@ -311,6 +314,7 @@ def main():
                 )
                 results["roi_production_real"]["market_coverage"] = production_coverage
                 results["roi_production_real"]["model_version"] = production_manifest.get("model_version")
+                results["roi_production_real"]["prediction_model_type"] = production_manifest.get("prediction_model_type")
                 results["production_market_comparison"] = compare_model_to_market(production_merged)
 
     real_result = results.get("roi_production_real", results.get("roi_real", {}))

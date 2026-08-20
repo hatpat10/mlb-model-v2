@@ -7,7 +7,8 @@ from artifact_utils import atomic_write_json
 
 REQUIRED_FILES = (
     "manifest.json", "feature_names.json", "train_medians.joblib",
-    "xgb_calibrated.joblib", "lgbm_calibrated.joblib",
+    "xgb.joblib", "lgbm.joblib", "xgb_calibrated.joblib", "lgbm_calibrated.joblib",
+    "ensemble.joblib", "ensemble_calibrated.joblib",
 )
 
 

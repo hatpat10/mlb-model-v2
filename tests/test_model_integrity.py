@@ -18,6 +18,16 @@ from scripts.betting_strategy import size_stake  # noqa: E402
 from scripts.decision_log import append_decisions  # noqa: E402
 from scripts.odds_utils import aggregate_h2h_event  # noqa: E402
 from scripts.performance_metrics import date_block_roi_ci  # noqa: E402
+import model_scoring  # noqa: E402
+from model_registry import publish_production_model  # noqa: E402
+
+
+class ConstantProbabilityModel:
+    def __init__(self, probability):
+        self.probability = probability
+
+    def predict_proba(self, X):
+        return [[1.0 - self.probability, self.probability] for _ in range(len(X))]
 
 
 def load_numbered_script(name):
@@ -45,6 +55,61 @@ class TemporalIntegrityTests(unittest.TestCase):
         self.assertFalse(train.isna().any().any())
         self.assertFalse(validation.isna().any().any())
         self.assertEqual(validation.loc[2, "future_source"], 7.0)
+
+    def test_selection_calibration_seasons_are_strictly_before_evaluation(self):
+        training = load_numbered_script("02_train")
+        selected = training.prior_calibration_years([2021, 2022, 2023, 2024, 2025], 2025)
+        self.assertEqual(selected, [2023, 2024])
+        self.assertTrue(all(year < 2025 for year in selected))
+
+    def test_candidate_promotion_requires_better_brier_without_material_auc_loss(self):
+        training = load_numbered_script("02_train")
+        metrics = {
+            "xgb_lgbm_calibrated_average": {
+                "brier": 0.244, "auc": 0.575, "accuracy": 0.55, "ece": 0.02,
+            },
+            "ensemble_calibrated.joblib": {
+                "brier": 0.243, "auc": 0.574, "accuracy": 0.56, "ece": 0.02,
+            },
+        }
+        self.assertEqual(training.choose_prediction_candidate(metrics), "ensemble_calibrated.joblib")
+        metrics["ensemble_calibrated.joblib"]["auc"] = 0.570
+        self.assertEqual(training.choose_prediction_candidate(metrics), "xgb_lgbm_calibrated_average")
+
+    def test_shared_scorer_honors_manifest_selected_probability_artifact(self):
+        X = pd.DataFrame({"feature": [1.0, 2.0]})
+        models = {
+            "xgb_calibrated.joblib": ConstantProbabilityModel(0.20),
+            "lgbm_calibrated.joblib": ConstantProbabilityModel(0.40),
+            "ensemble_calibrated.joblib": ConstantProbabilityModel(0.70),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            model_dir = Path(temp)
+            (model_dir / "ensemble_calibrated.joblib").touch()
+            with mock.patch.object(
+                model_scoring.joblib, "load", side_effect=lambda path: models[Path(path).name],
+            ):
+                scored = model_scoring.score_probability_bundle(
+                    model_dir, X,
+                    {"mode": "production", "schema_version": 3,
+                     "prediction_artifact": "ensemble_calibrated.joblib"},
+                )
+        self.assertEqual(scored["home_probability"].tolist(), [0.7, 0.7])
+        self.assertEqual(scored["prediction_model_type"], "calibrated_weighted_ensemble")
+        self.assertAlmostEqual(scored["model_disagreement"][0], 0.2)
+
+    def test_production_registry_rejects_bundle_without_calibrated_ensemble(self):
+        with tempfile.TemporaryDirectory() as temp:
+            models_root = Path(temp) / "models"
+            artifact_dir = models_root / "production" / "candidate"
+            artifact_dir.mkdir(parents=True)
+            for name in (
+                "manifest.json", "feature_names.json", "train_medians.joblib",
+                "xgb_calibrated.joblib", "lgbm_calibrated.joblib",
+            ):
+                (artifact_dir / name).touch()
+            with self.assertRaises(FileNotFoundError):
+                publish_production_model(models_root, artifact_dir, "candidate")
 
     def test_appending_future_games_does_not_mutate_prior_rolling_features(self):
         rows = []
@@ -279,6 +344,7 @@ class RiskAndMatchingTests(unittest.TestCase):
                 "edge": 0.13, "run_id": "predict_test",
                 "generated_at_utc": datetime.now(timezone.utc).isoformat(),
                 "model_version": "model_test", "model_mode": "production",
+                "prediction_model_type": "calibrated_weighted_ensemble",
                 "data_version": "data_test", "feature_build_id": "feature_test",
                 "odds_event_id": "event_test", "bookmaker_key": "book_test",
                 "bookmaker_title": "Book Test", "odds_snapshot_utc": datetime.now(timezone.utc).isoformat(),
@@ -294,6 +360,7 @@ class RiskAndMatchingTests(unittest.TestCase):
                 bankroll.cmd_log_bets(date, resume=False, force=False, game_pks=["999"])
                 log = pd.read_csv(outputs / "bet_log.csv", dtype={"game_pk": str})
             self.assertEqual(log.loc[0, "model_version"], "model_test")
+            self.assertEqual(log.loc[0, "prediction_model_type"], "calibrated_weighted_ensemble")
             self.assertEqual(log.loc[0, "odds_event_id"], "event_test")
             self.assertEqual(log.loc[0, "bookmaker_key"], "best_home")
             self.assertEqual(log.loc[0, "execution_mode"], "paper")

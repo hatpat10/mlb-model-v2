@@ -1,7 +1,7 @@
 # MLB Model V2
 
-MLB moneyline betting model: R data collection → Python feature build → calibrated
-XGB/LGBM ensemble → daily predictions with edge detection against de-vigged market
+MLB moneyline betting model: R data collection → Python feature build → honestly
+selected probability model → daily predictions with edge detection against de-vigged market
 consensus → quarter-Kelly bet logging with CLV tracking.
 
 The system deliberately separates a frozen research benchmark from the live
@@ -19,12 +19,15 @@ reported separately, and only the auditable forward ledger can validate deployme
   - `01_build_features.py` — raw CSVs → `data/processed/feature_matrix.csv`
   - `02_train.py` — `--mode benchmark` preserves the 2021–2023/2024 holdout;
     `--mode production` trains through the latest completed season and publishes
-    an atomic, versioned model bundle using expanding-season rolling-origin validation
+    an atomic, versioned model bundle. Hyperparameters stop before the evaluation
+    season; the untouched next season selects among raw/calibrated single models,
+    averages, and the weighted ensemble before the final future model is fit
   - `03_backtest.py` — frozen holdout metrics plus close-time retrospective ROI,
     model-versus-market metrics, coverage, drawdown, and date-block uncertainty
   - `04_predict.py` — daily slate: probables, posted lineups + home-plate umpire
     (live from MLB boxscore), de-vigged consensus odds, best side-specific quoted
-    prices, edge flags, and an append-only decision/no-bet history
+    prices, manifest-selected model scoring, edge flags, and an append-only
+    decision/no-bet history
   - `05_bankroll.py` — auditable quarter-Kelly decisions; per-bet/daily/open-exposure
     caps; ledger-derived bankroll recovery; settlement, CLV, and drawdown pause
   - `06_runner.py` — fail-closed daily orchestrator with raw/feature/model gates
