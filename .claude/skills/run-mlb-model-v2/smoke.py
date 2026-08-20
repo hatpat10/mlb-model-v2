@@ -59,8 +59,9 @@ def check_imports():
     # functions directly (see SKILL.md "Direct invocation").
     for name in ("model_classes", "odds_utils", "01_build_features", "02_train",
                  "03_backtest", "04_predict", "05_bankroll", "06_runner",
-                 "07_capture_closing_lines", "wait_for_odds_and_predict",
-                 "artifact_utils", "betting_strategy", "pipeline_health", "model_registry"):
+                 "07_capture_closing_lines", "08_forward_performance", "wait_for_odds_and_predict",
+                 "artifact_utils", "betting_strategy", "decision_log", "performance_metrics",
+                 "pipeline_health", "model_registry"):
         path = SCRIPTS / f"{name}.py"
         try:
             spec = importlib.util.spec_from_file_location(f"smoke_{name}", path)
@@ -123,6 +124,7 @@ def main():
     check_model_scoring()
     run_script("-m", ["unittest", "discover", "-s", "tests", "-v"])
     run_script("scripts/03_backtest.py")
+    run_script("scripts/08_forward_performance.py")
 
     if args.predict:
         run_script(f"scripts/04_predict.py", ["--date", args.date], timeout=900)

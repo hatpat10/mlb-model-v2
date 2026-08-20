@@ -27,12 +27,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config.config import (  # noqa: E402
     PATHS, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE, TEAM_ABBREV_MAP,
-    REQUIRE_POSTED_LINEUPS_FOR_BET, REQUIRE_UMPIRE_FOR_BET,
+    REQUIRE_POSTED_LINEUPS_FOR_BET, REQUIRE_UMPIRE_FOR_BET, BETTING_EXECUTION_MODE,
 )
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from odds_utils import aggregate_h2h_event  # noqa: E402
 from artifact_utils import atomic_write_csv, make_run_id, sha256_file, utc_now_iso  # noqa: E402
 from model_registry import resolve_production_model_dir  # noqa: E402
+from decision_log import append_decisions  # noqa: E402
 from features import builder  # noqa: E402
 from features.pitcher_utils import filter_verified_starts  # noqa: E402
 
@@ -153,6 +154,15 @@ def fetch_moneyline_odds() -> pd.DataFrame:
             "bookmaker_key": agg.get("bookmaker_key"),
             "bookmaker_title": agg.get("bookmaker_title"),
             "bookmaker_last_update": agg.get("bookmaker_last_update"),
+            "home_bookmaker_key": agg.get("home_bookmaker_key"),
+            "home_bookmaker_title": agg.get("home_bookmaker_title"),
+            "home_bookmaker_last_update": agg.get("home_bookmaker_last_update"),
+            "away_bookmaker_key": agg.get("away_bookmaker_key"),
+            "away_bookmaker_title": agg.get("away_bookmaker_title"),
+            "away_bookmaker_last_update": agg.get("away_bookmaker_last_update"),
+            "book_prob_std": agg.get("book_prob_std"),
+            "book_prob_range": agg.get("book_prob_range"),
+            "price_selection_method": agg.get("price_selection_method"),
         })
     return pd.DataFrame(rows)
 
@@ -411,6 +421,7 @@ def main():
     game_df["model_training_data_version"] = model_manifest.get("data_version")
     game_df["model_feature_build_id"] = model_manifest.get("feature_build_id")
     game_df["odds_snapshot_utc"] = generated_at_utc
+    game_df["execution_mode"] = BETTING_EXECUTION_MODE
 
     game_df["starters_confirmed"] = game_df["home_starter"].notna() & game_df["away_starter"].notna()
     game_df["market_available"] = (
@@ -462,8 +473,11 @@ def main():
     game_df.to_excel(xlsx_path, index=False)
     history_path = OUTPUTS / "prediction_history" / date / f"{run_id}.csv"
     atomic_write_csv(game_df, history_path)
+    decision_log_path = OUTPUTS / "decision_log.csv"
+    appended = append_decisions(game_df, decision_log_path, BETTING_EXECUTION_MODE)
     logger.info(f"Saved {csv_path} and {xlsx_path}")
     logger.info(f"Immutable decision snapshot: {history_path}")
+    logger.info(f"Durable decision log: appended {appended} rows -> {decision_log_path}")
 
 
 if __name__ == "__main__":

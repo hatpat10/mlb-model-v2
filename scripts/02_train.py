@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config.config import (  # noqa: E402
     PATHS, TRAIN_YEARS, TEST_YEAR, CALIBRATION_YEARS,
     PRODUCTION_TRAIN_YEARS, PRODUCTION_CALIBRATION_YEARS,
-    PRODUCTION_OPTUNA_TRIALS,
+    PRODUCTION_OPTUNA_TRIALS, PRODUCTION_MODEL_SCHEMA_VERSION,
 )
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from artifact_utils import atomic_write_json, make_run_id, sha256_file, utc_now_iso  # noqa: E402
@@ -50,6 +50,42 @@ N_OPTUNA_TRIALS = 60
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 logger.add(LOGS / "02_train.log", level="DEBUG", rotation="5 MB")
+
+
+class ExpandingYearSplit:
+    """Rolling-origin folds that never train and validate within one season."""
+
+    def __init__(self, years):
+        self.years = np.asarray(years, dtype=int)
+        unique_years = sorted(np.unique(self.years).tolist())
+        if len(unique_years) < 2:
+            raise ValueError("ExpandingYearSplit requires at least two seasons")
+        self.validation_years = unique_years[1:]
+
+    def split(self, X, y=None, groups=None):
+        if len(X) != len(self.years):
+            raise ValueError("X length does not match the configured year vector")
+        for validation_year in self.validation_years:
+            train_index = np.flatnonzero(self.years < validation_year)
+            validation_index = np.flatnonzero(self.years == validation_year)
+            if len(train_index) and len(validation_index):
+                yield train_index, validation_index
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return len(self.validation_years)
+
+
+def fold_matrices(X, train_index, validation_index):
+    """Impute each validation fold from its own strictly-prior training rows."""
+    train = X.iloc[train_index]
+    validation = X.iloc[validation_index]
+    # Some sources/features did not exist in the earliest seasons. If an
+    # entire training fold is missing a feature, there is no historical
+    # distribution to borrow from without leakage. Zero is a neutral,
+    # constant placeholder; the model cannot learn signal from that column
+    # until a later fold has genuine prior observations.
+    medians = train.median().fillna(0.0)
+    return train.fillna(medians), validation.fillna(medians)
 
 
 def load_data(mode="benchmark"):
@@ -89,9 +125,10 @@ def tune_logreg(X, y, tscv):
     for c in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
         aucs = []
         for tr_idx, val_idx in tscv.split(X):
+            X_tr, X_val = fold_matrices(X, tr_idx, val_idx)
             model = make_pipeline(StandardScaler(), LogisticRegression(C=c, max_iter=5000, solver="lbfgs"))
-            model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-            preds = model.predict_proba(X.iloc[val_idx])[:, 1]
+            model.fit(X_tr, y.iloc[tr_idx])
+            preds = model.predict_proba(X_val)[:, 1]
             aucs.append(roc_auc_score(y.iloc[val_idx], preds))
         mean_auc = np.mean(aucs)
         if mean_auc > best_auc:
@@ -114,9 +151,10 @@ def tune_xgb(X, y, tscv):
         }
         aucs = []
         for tr_idx, val_idx in tscv.split(X):
+            X_tr, X_val = fold_matrices(X, tr_idx, val_idx)
             model = xgb.XGBClassifier(**params, eval_metric="logloss", random_state=42)
-            model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-            preds = model.predict_proba(X.iloc[val_idx])[:, 1]
+            model.fit(X_tr, y.iloc[tr_idx])
+            preds = model.predict_proba(X_val)[:, 1]
             aucs.append(roc_auc_score(y.iloc[val_idx], preds))
         return float(np.mean(aucs))
 
@@ -141,9 +179,10 @@ def tune_lgbm(X, y, tscv):
         }
         aucs = []
         for tr_idx, val_idx in tscv.split(X):
+            X_tr, X_val = fold_matrices(X, tr_idx, val_idx)
             model = lgb.LGBMClassifier(**params, random_state=42, verbosity=-1)
-            model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-            preds = model.predict_proba(X.iloc[val_idx])[:, 1]
+            model.fit(X_tr, y.iloc[tr_idx])
+            preds = model.predict_proba(X_val)[:, 1]
             aucs.append(roc_auc_score(y.iloc[val_idx], preds))
         return float(np.mean(aucs))
 
@@ -172,10 +211,11 @@ def oof_predictions(model_specs, X, y, tscv):
     """
     oof = {name: np.full(len(X), np.nan) for name in model_specs}
     for tr_idx, val_idx in tscv.split(X):
+        X_tr, X_val = fold_matrices(X, tr_idx, val_idx)
         for name, (factory_name, params) in model_specs.items():
             model = make_model(factory_name, params)
-            model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-            oof[name][val_idx] = model.predict_proba(X.iloc[val_idx])[:, 1]
+            model.fit(X_tr, y.iloc[tr_idx])
+            oof[name][val_idx] = model.predict_proba(X_val)[:, 1]
     return oof
 
 
@@ -215,14 +255,26 @@ def main():
     y_test = test_df["home_win"].astype(int)
     X_train, X_test = median_impute(train_df, test_df, features, artifact_dir)
 
-    tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+    # Preserve the published benchmark procedure exactly. Production uses
+    # true season-level rolling origin: 2021 -> 2022, 2021-22 -> 2023, etc.
+    # Raw feature rows are passed to that CV path so each fold's missing-value
+    # medians are learned only from its strictly-prior training seasons.
+    if args.mode == "benchmark":
+        tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+        X_cv = X_train
+        validation_scheme = f"row_time_series_{N_SPLITS}_fold"
+    else:
+        tscv = ExpandingYearSplit(train_df["year"].values)
+        X_cv = train_df[features]
+        validation_scheme = "expanding_season_rolling_origin"
+    logger.info(f"Validation scheme: {validation_scheme} ({tscv.get_n_splits()} folds)")
 
     logger.info("Tuning LogisticRegression ...")
-    lr_params = tune_logreg(X_train, y_train, tscv)
+    lr_params = tune_logreg(X_cv, y_train, tscv)
     logger.info("Tuning XGBoost (Optuna, {} trials) ...".format(N_OPTUNA_TRIALS))
-    xgb_params = tune_xgb(X_train, y_train, tscv)
+    xgb_params = tune_xgb(X_cv, y_train, tscv)
     logger.info("Tuning LightGBM (Optuna, {} trials) ...".format(N_OPTUNA_TRIALS))
-    lgbm_params = tune_lgbm(X_train, y_train, tscv)
+    lgbm_params = tune_lgbm(X_cv, y_train, tscv)
     rf_params = {"n_estimators": 300, "max_depth": 6, "min_samples_leaf": 5}
 
     model_specs = {
@@ -232,8 +284,8 @@ def main():
         "rf": ("rf", rf_params),
     }
 
-    logger.info("Running shared 3-fold OOF pass for ensemble weights + calibration fitting ...")
-    oof = oof_predictions(model_specs, X_train, y_train, tscv)
+    logger.info(f"Running shared {tscv.get_n_splits()}-fold OOF pass for ensemble weights + calibration fitting ...")
+    oof = oof_predictions(model_specs, X_cv, y_train, tscv)
 
     weights = {}
     for name, preds in oof.items():
@@ -274,30 +326,52 @@ def main():
     with open(artifact_dir / "feature_names.json", "w") as f:
         json.dump(names_blob, f, indent=2)
 
-    evaluation_label = f"{eval_year} HOLDOUT" if args.mode == "benchmark" else f"{eval_year} TRAINING DIAGNOSTIC"
+    evaluation_label = f"{eval_year} HOLDOUT" if args.mode == "benchmark" else f"{eval_year} ROLLING-ORIGIN VALIDATION"
     logger.info(f"========== {evaluation_label} ==========")
-    xgb_test_proba = calibrated_models["xgb"].predict_proba(X_test)[:, 1]
-    lgbm_test_proba = calibrated_models["lgbm"].predict_proba(X_test)[:, 1]
-    avg_calibrated_proba = (xgb_test_proba + lgbm_test_proba) / 2.0
-    ensemble_proba = ensemble.predict_proba(X_test)[:, 1]
+    if args.mode == "benchmark":
+        xgb_eval_proba = calibrated_models["xgb"].predict_proba(X_test)[:, 1]
+        lgbm_eval_proba = calibrated_models["lgbm"].predict_proba(X_test)[:, 1]
+        average_eval_proba = (xgb_eval_proba + lgbm_eval_proba) / 2.0
+        ensemble_eval_proba = ensemble.predict_proba(X_test)[:, 1]
+        y_eval = y_test.values
+        evaluation_series = [
+            ("calibrated XGB", xgb_eval_proba),
+            ("calibrated LGBM", lgbm_eval_proba),
+            ("avg(calibrated XGB, calibrated LGBM) [used by 04_predict.py]", average_eval_proba),
+            ("uncalibrated weighted ensemble", ensemble_eval_proba),
+        ]
+    else:
+        eval_mask = train_df["year"].eq(eval_year).values
+        valid_eval = eval_mask & ~np.isnan(oof["xgb"]) & ~np.isnan(oof["lgbm"])
+        y_eval = y_train.values[valid_eval]
+        xgb_eval_proba = oof["xgb"][valid_eval]
+        lgbm_eval_proba = oof["lgbm"][valid_eval]
+        average_eval_proba = (xgb_eval_proba + lgbm_eval_proba) / 2.0
+        weighted_sum = sum(oof[name][valid_eval] * weights[name] for name in model_specs)
+        ensemble_eval_proba = weighted_sum / sum(weights.values())
+        evaluation_series = [
+            ("rolling-origin XGB (uncalibrated)", xgb_eval_proba),
+            ("rolling-origin LGBM (uncalibrated)", lgbm_eval_proba),
+            ("rolling-origin avg(XGB, LGBM)", average_eval_proba),
+            ("rolling-origin weighted ensemble", ensemble_eval_proba),
+        ]
 
-    y_test_arr = y_test.values
-    for label, proba in [
-        ("calibrated XGB", xgb_test_proba),
-        ("calibrated LGBM", lgbm_test_proba),
-        ("avg(calibrated XGB, calibrated LGBM) [used by 04_predict.py]", avg_calibrated_proba),
-        ("uncalibrated weighted ensemble", ensemble_proba),
-    ]:
-        auc = roc_auc_score(y_test_arr, proba)
-        acc = accuracy_score(y_test_arr, (proba >= 0.5).astype(int))
-        brier = brier_score_loss(y_test_arr, proba)
-        ece = expected_calibration_error(y_test_arr, proba)
+    evaluation_metrics = {}
+    for label, proba in evaluation_series:
+        auc = roc_auc_score(y_eval, proba)
+        acc = accuracy_score(y_eval, (proba >= 0.5).astype(int))
+        brier = brier_score_loss(y_eval, proba)
+        ece = expected_calibration_error(y_eval, proba)
+        evaluation_metrics[label] = {
+            "auc": float(auc), "accuracy": float(acc), "brier": float(brier), "ece": float(ece),
+        }
         logger.info(f"{label}: AUC={auc:.4f}  Acc={acc:.4f}  Brier={brier:.4f}  ECE={ece:.4f}")
 
-    frac_pos, mean_pred = calibration_curve(y_test_arr, avg_calibrated_proba, n_bins=10)
+    frac_pos, mean_pred = calibration_curve(y_eval, average_eval_proba, n_bins=10)
     plt.figure(figsize=(6, 6))
     plt.plot([0, 1], [0, 1], "k--", label="Perfectly calibrated")
-    plt.plot(mean_pred, frac_pos, marker="o", label="avg(calibrated XGB, LGBM)")
+    curve_label = "avg(calibrated XGB, LGBM)" if args.mode == "benchmark" else "rolling-origin avg(XGB, LGBM)"
+    plt.plot(mean_pred, frac_pos, marker="o", label=curve_label)
     plt.xlabel("Mean predicted probability")
     plt.ylabel("Fraction of actual home wins")
     plt.title(f"Calibration curve — {evaluation_label.lower()}")
@@ -314,13 +388,15 @@ def main():
             feature_manifest = json.load(handle)
     model_files = ["train_medians.joblib", "ensemble.joblib", "xgb_calibrated.joblib", "lgbm_calibrated.joblib", "feature_names.json"]
     manifest = {
-        "schema_version": 1,
+        "schema_version": 1 if args.mode == "benchmark" else PRODUCTION_MODEL_SCHEMA_VERSION,
         "model_version": model_version,
         "created_at_utc": utc_now_iso(),
         "mode": args.mode,
         "training_years": train_years,
         "calibration_years": calibration_years,
         "evaluation_year": eval_year,
+        "validation_scheme": validation_scheme,
+        "validation_metrics": evaluation_metrics,
         "optuna_trials": N_OPTUNA_TRIALS,
         "feature_build_id": feature_manifest.get("build_id"),
         "data_version": feature_manifest.get("data_version"),

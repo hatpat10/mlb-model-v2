@@ -5,8 +5,9 @@ XGB/LGBM ensemble → daily predictions with edge detection against de-vigged ma
 consensus → quarter-Kelly bet logging with CLV tracking.
 
 The system deliberately separates a frozen research benchmark from the live
-production bundle. A positive result is not treated as proof of profitability
-until the real-price validation thresholds and confidence-interval gate pass.
+production bundle. A positive result is not treated as proof of profitability.
+Retrospective closing-price results and actual forward paper/live results are
+reported separately, and only the auditable forward ledger can validate deployment.
 
 ## Layout
 
@@ -18,24 +19,30 @@ until the real-price validation thresholds and confidence-interval gate pass.
   - `01_build_features.py` — raw CSVs → `data/processed/feature_matrix.csv`
   - `02_train.py` — `--mode benchmark` preserves the 2021–2023/2024 holdout;
     `--mode production` trains through the latest completed season and publishes
-    an atomic, versioned model bundle
-  - `03_backtest.py` — frozen holdout metrics plus sequential capped-bankroll ROI
-    against real quoted prices, market coverage, drawdown, and a bootstrap interval
+    an atomic, versioned model bundle using expanding-season rolling-origin validation
+  - `03_backtest.py` — frozen holdout metrics plus close-time retrospective ROI,
+    model-versus-market metrics, coverage, drawdown, and date-block uncertainty
   - `04_predict.py` — daily slate: probables, posted lineups + home-plate umpire
-    (live from MLB boxscore), de-vigged consensus odds, edge flags
+    (live from MLB boxscore), de-vigged consensus odds, best side-specific quoted
+    prices, edge flags, and an append-only decision/no-bet history
   - `05_bankroll.py` — auditable quarter-Kelly decisions; per-bet/daily/open-exposure
     caps; ledger-derived bankroll recovery; settlement, CLV, and drawdown pause
   - `06_runner.py` — fail-closed daily orchestrator with raw/feature/model gates
   - `07_capture_closing_lines.py` — wakes before each start time to capture real
-    closing lines; `--pregame-predict` re-runs predict + bet logging 2h before first pitch
+    closing lines; `--pregame-predict` polls the free MLB lineup feed from T-2h and
+    decides when lineups post, with a final T-15m cutoff
+  - `08_forward_performance.py` — actual settled paper/live ROI, CLV, drawdown,
+    date-block uncertainty, lineage coverage, and explicit deployment gates
 - `config/config.py` — paths, betting parameters, team maps, league-average imputes.
 - `scripts/pipeline_health.py` — schema, key, freshness, row-count, and artifact-hash gates.
 - `tests/` — temporal invariance, odds matching, risk, and ledger tests.
 
-Prediction files carry the complete lineage chain: feature/data build, model
-version, prediction run, Odds API event, representative bookmaker quote, live
-lineup/umpire availability, and the stake rule that constrained any logged bet.
-Posted lineups are required before a row can become bet-eligible.
+Prediction and ledger files carry the complete lineage chain: feature/data build,
+model version, prediction run, Odds API event, side-specific executable bookmaker
+quote, market dispersion, live lineup/umpire availability, and the stake rule that
+constrained any logged bet. Posted lineups are required before a row can become
+bet-eligible. `outputs/decision_log.csv` and `outputs/bet_log.csv` are durable,
+tracked history; regenerated prediction workbooks are not evidence records.
 
 ## Daily automation (Windows Task Scheduler)
 

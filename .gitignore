@@ -25,6 +25,7 @@ models/*
 !models/bankroll_state.json
 outputs/*
 !outputs/bet_log.csv
+!outputs/decision_log.csv
 logs/
 
 # Local Claude Code settings

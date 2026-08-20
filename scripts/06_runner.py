@@ -5,8 +5,9 @@
   3. scripts/04_predict.py --date today   (early read — no bets logged)
   4. scripts/05_bankroll.py --settle      (settle yesterday's bets)
   5. fallback bet-logging safety net (see check_and_fallback_log_bets below)
-  6. git commit+push of the betting-history files (bet log, bankroll state,
-     closing lines) — the only pipeline outputs that can't be regenerated.
+  6. git commit+push of the betting-history files (decision log, bet log,
+     bankroll state, closing lines) — the only pipeline outputs that can't
+     be regenerated.
 Required dependencies fail closed: stale/invalid collection prevents feature
 building, and an invalid feature build prevents prediction and bet logging.
 Settlement and history backup are still attempted independently.
@@ -37,7 +38,10 @@ from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config.config import PATHS, BETTING_BACKUP_BRANCH, PRODUCTION_TRAIN_YEARS  # noqa: E402
+from config.config import (  # noqa: E402
+    PATHS, BETTING_BACKUP_BRANCH, PRODUCTION_TRAIN_YEARS, PREGAME_PREDICT_LEAD_HOURS,
+    PRODUCTION_MODEL_SCHEMA_VERSION,
+)
 from odds_utils import fetch_slate  # noqa: E402
 from model_registry import resolve_production_model_dir  # noqa: E402
 
@@ -53,7 +57,7 @@ RSCRIPT_CANDIDATES = [
 # lead time the normal near-game-time bet-logging pass needs before first
 # pitch. Used here only to decide whether that pass still has a fair chance
 # to run — not to duplicate its snapshot/predict logic.
-PREGAME_PREDICT_LEAD = timedelta(hours=2)
+PREGAME_PREDICT_LEAD = timedelta(hours=PREGAME_PREDICT_LEAD_HOURS)
 
 today = datetime.now().strftime("%Y-%m-%d")
 log_path = LOGS / f"daily_{today}.log"
@@ -102,7 +106,7 @@ def backup_betting_history():
     when nothing changed since the last run.
     """
     import glob as _glob
-    files = ["outputs/bet_log.csv", "models/bankroll_state.json"]
+    files = ["outputs/decision_log.csv", "outputs/bet_log.csv", "models/bankroll_state.json"]
     files += sorted(_glob.glob("data/raw/odds_close_*.csv"))
     existing = [f for f in files if (ROOT / f).exists()]
     if not existing:
@@ -216,6 +220,8 @@ def production_model_is_current():
     return (
         model_manifest.get("training_years") == PRODUCTION_TRAIN_YEARS
         and model_manifest.get("production_feature_version") == feature_manifest.get("production_feature_version")
+        and model_manifest.get("schema_version") == PRODUCTION_MODEL_SCHEMA_VERSION
+        and model_manifest.get("validation_scheme") == "expanding_season_rolling_origin"
     )
 
 
@@ -268,6 +274,9 @@ def main():
         results["predict"] = False
     results["fallback logging"] = check_and_fallback_log_bets() if results["predict"] else False
     results["settle bets"] = run_step("settle bets", [str(PYTHON), "scripts/05_bankroll.py", "--settle"])
+    results["forward performance"] = run_step(
+        "forward performance", [str(PYTHON), "scripts/08_forward_performance.py"],
+    )
     results["backup betting history"] = backup_betting_history()
 
     logger.info("========== SUMMARY ==========")

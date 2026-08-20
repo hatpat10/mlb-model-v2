@@ -81,13 +81,11 @@ def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
     a single stale/outlier book (e.g. one already showing an
     in-play-looking price like -10000) isn't a market consensus.
 
-    Otherwise returns a dict with:
-      no_vig_home_implied — median of each book's own no-vig home probability
-      home_ml / away_ml   — a real, quotable price from the book whose
-                            no-vig probability is closest to that median
-                            (for bet sizing; never a synthetic price nobody
-                            is actually offering)
-      n_books             — how many books contributed
+    Otherwise returns a dict with a consensus probability plus the best
+    independently executable price for each side across the quoted books.
+    The consensus determines edge; the side-specific best price determines
+    payout and stake. This explicitly models line shopping and never creates
+    a synthetic American price.
     """
     home_name = event.get("home_team")
     away_name = event.get("away_team")
@@ -122,9 +120,27 @@ def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
     no_vig_home_implied = float(np.median(book_no_vig_home))
     closest_idx = int(np.argmin(np.abs(np.array(book_no_vig_home) - no_vig_home_implied)))
     representative = book_prices[closest_idx]
+    best_home = max(book_prices, key=lambda price: float(price["home_ml"]))
+    best_away = max(book_prices, key=lambda price: float(price["away_ml"]))
+    probabilities = np.asarray(book_no_vig_home, dtype=float)
 
     return {
         "no_vig_home_implied": no_vig_home_implied,
-        **representative,
+        "home_ml": best_home["home_ml"],
+        "away_ml": best_away["away_ml"],
+        "home_bookmaker_key": best_home.get("bookmaker_key"),
+        "home_bookmaker_title": best_home.get("bookmaker_title"),
+        "home_bookmaker_last_update": best_home.get("bookmaker_last_update"),
+        "away_bookmaker_key": best_away.get("bookmaker_key"),
+        "away_bookmaker_title": best_away.get("bookmaker_title"),
+        "away_bookmaker_last_update": best_away.get("bookmaker_last_update"),
+        "representative_home_ml": representative["home_ml"],
+        "representative_away_ml": representative["away_ml"],
+        "bookmaker_key": representative.get("bookmaker_key"),
+        "bookmaker_title": representative.get("bookmaker_title"),
+        "bookmaker_last_update": representative.get("bookmaker_last_update"),
+        "book_prob_std": float(probabilities.std(ddof=0)),
+        "book_prob_range": float(probabilities.max() - probabilities.min()),
+        "price_selection_method": "best_available_across_quoted_books",
         "n_books": len(book_no_vig_home),
     }

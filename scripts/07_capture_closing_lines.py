@@ -23,9 +23,10 @@ Usage:
   python scripts/07_capture_closing_lines.py --date YYYY-MM-DD
   python scripts/07_capture_closing_lines.py --once          # single snapshot now, then exit
   python scripts/07_capture_closing_lines.py --pregame-predict
-      # additionally, 2 hours before EACH distinct start time (not just the
-      # day's first game), re-run 04_predict.py + 05_bankroll.py --log-bets
-      # so bets are logged with posted lineups/umpires and near-final lines
+      # additionally, beginning 2 hours before EACH distinct start time,
+      # poll the free MLB feed until lineups post, then re-run 04_predict.py
+      # + 05_bankroll.py --log-bets. A final decision is recorded 15 minutes
+      # before first pitch even if a lineup never posts.
       # (the 8 AM run's already-logged games are skipped by 05_bankroll's
       # dupe guard). Bets are only logged if 04_predict.py exits
       # successfully AND writes a fresh predictions_<date>.csv this
@@ -40,7 +41,6 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 import requests
 from loguru import logger
@@ -48,7 +48,10 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config.config import PATHS  # noqa: E402
+from config.config import (  # noqa: E402
+    PATHS, PREGAME_PREDICT_LEAD_HOURS, LINEUP_POLL_INTERVAL_MINUTES,
+    PREGAME_DECISION_CUTOFF_MINUTES,
+)
 from odds_utils import aggregate_h2h_event, fetch_slate, MIN_BOOKMAKERS  # noqa: E402
 from artifact_utils import atomic_write_csv  # noqa: E402
 
@@ -61,7 +64,9 @@ PYTHON = ROOT / "venv" / "Scripts" / "python.exe"
 ODDS_API = "https://api.the-odds-api.com/v4"
 SNAPSHOT_LEAD = timedelta(minutes=5)    # wake this long before each start time
 STARTED_GRACE = timedelta(minutes=2)    # still accept a snapshot this soon after start
-PREGAME_PREDICT_LEAD = timedelta(hours=2)
+PREGAME_PREDICT_LEAD = timedelta(hours=PREGAME_PREDICT_LEAD_HOURS)
+LINEUP_POLL_INTERVAL = timedelta(minutes=LINEUP_POLL_INTERVAL_MINUTES)
+PREGAME_DECISION_CUTOFF = timedelta(minutes=PREGAME_DECISION_CUTOFF_MINUTES)
 MAX_RUNTIME_HOURS = 18
 
 logger.remove()
@@ -158,6 +163,15 @@ def write_snapshot(date: str, slate: pd.DataFrame, matched: dict, now_utc: datet
             "bookmaker_key": agg.get("bookmaker_key"),
             "bookmaker_title": agg.get("bookmaker_title"),
             "bookmaker_last_update": agg.get("bookmaker_last_update"),
+            "home_bookmaker_key": agg.get("home_bookmaker_key"),
+            "home_bookmaker_title": agg.get("home_bookmaker_title"),
+            "home_bookmaker_last_update": agg.get("home_bookmaker_last_update"),
+            "away_bookmaker_key": agg.get("away_bookmaker_key"),
+            "away_bookmaker_title": agg.get("away_bookmaker_title"),
+            "away_bookmaker_last_update": agg.get("away_bookmaker_last_update"),
+            "book_prob_std": agg.get("book_prob_std"),
+            "book_prob_range": agg.get("book_prob_range"),
+            "price_selection_method": agg.get("price_selection_method"),
             "home_ml_close": agg["home_ml"],
             "away_ml_close": agg["away_ml"],
             "home_no_vig_prob": agg["no_vig_home_implied"],
@@ -172,6 +186,35 @@ def write_snapshot(date: str, slate: pd.DataFrame, matched: dict, now_utc: datet
     out = out.sort_values("commence_time_utc").reset_index(drop=True)
     atomic_write_csv(out, path)
     return updated
+
+
+def fetch_games_with_full_lineups(game_pks: list[str]) -> set[str]:
+    """Return games whose MLB boxscore has at least nine batters per side."""
+    ready = set()
+    for game_pk in game_pks:
+        try:
+            response = requests.get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore", timeout=20)
+            response.raise_for_status()
+            teams = response.json().get("teams", {})
+            home = teams.get("home", {}).get("battingOrder") or []
+            away = teams.get("away", {}).get("battingOrder") or []
+            if len(home) >= 9 and len(away) >= 9:
+                ready.add(str(game_pk))
+        except requests.RequestException as error:
+            logger.warning(f"Lineup readiness fetch failed for game {game_pk}: {error}")
+    return ready
+
+
+def plan_lineup_decision(now_utc: datetime, start_utc: datetime, game_pks: list[str], ready_pks: set[str]):
+    """Split a start-time cluster into decisions to run now and retry later."""
+    pending = [str(game_pk) for game_pk in game_pks]
+    cutoff = start_utc - PREGAME_DECISION_CUTOFF
+    if now_utc >= cutoff:
+        return pending, [], None
+    run_now = [game_pk for game_pk in pending if game_pk in ready_pks]
+    retry = [game_pk for game_pk in pending if game_pk not in ready_pks]
+    next_wake = min(now_utc + LINEUP_POLL_INTERVAL, cutoff) if retry else None
+    return run_now, retry, next_wake
 
 
 def run_pregame_predict(date: str, game_pks: list[str]) -> bool:
@@ -260,12 +303,12 @@ def main():
     # Wake plan: one baseline snapshot now, then one wake per distinct start
     # time (5 min before it), plus the optional pre-game re-predict wake.
     now = datetime.now(timezone.utc)
-    wakes = []  # (when_utc, kind, game_pks)
+    wakes = []  # (when_utc, kind, game_pks, cluster_start_utc)
     for start in sorted(slate["start_utc"].unique()):
         start = pd.Timestamp(start).to_pydatetime()
         wake_at = start - SNAPSHOT_LEAD
         if wake_at > now:
-            wakes.append((wake_at, "close", []))
+            wakes.append((wake_at, "close", [], start))
         else:
             logger.warning(f"Start time {start:%H:%M UTC} already within {SNAPSHOT_LEAD} — "
                            f"baseline snapshot will serve as its closing line.")
@@ -280,12 +323,12 @@ def main():
             cluster_pks = slate.loc[pd.to_datetime(slate["start_utc"], utc=True) == pd.Timestamp(start), "game_pk"].astype(str).tolist()
             predict_at = start - PREGAME_PREDICT_LEAD
             if predict_at > now:
-                wakes.append((predict_at, "predict", cluster_pks))
+                wakes.append((predict_at, "predict", cluster_pks, start))
             else:
                 if now < start:
                     logger.warning(f"Start time {start:%H:%M UTC} is inside the normal lead window — "
                                    "running its pre-game decision immediately.")
-                    wakes.append((now, "predict", cluster_pks))
+                    wakes.append((now, "predict", cluster_pks, start))
                 else:
                     logger.warning(f"Start time {start:%H:%M UTC} has passed — no new decision will be logged.")
     wakes.sort(key=lambda w: w[0])
@@ -293,7 +336,8 @@ def main():
     snapshot("baseline")
 
     deadline = now + timedelta(hours=MAX_RUNTIME_HOURS)
-    for wake_at, kind, game_pks in wakes:
+    while wakes:
+        wake_at, kind, game_pks, cluster_start = wakes.pop(0)
         wait = (wake_at - datetime.now(timezone.utc)).total_seconds()
         if wait > 0:
             if wake_at > deadline:
@@ -302,8 +346,21 @@ def main():
             logger.info(f"Sleeping {wait/60:.0f} min until {wake_at:%H:%M UTC} ({kind}) ...")
             time.sleep(wait)
         if kind == "predict":
-            if not run_pregame_predict(date, game_pks):
-                failures.append(f"predict:{','.join(game_pks)}")
+            ready_pks = fetch_games_with_full_lineups(game_pks)
+            run_now, retry_pks, next_wake = plan_lineup_decision(
+                datetime.now(timezone.utc), cluster_start, game_pks, ready_pks,
+            )
+            if run_now:
+                logger.info(f"Lineup decision: {len(run_now)}/{len(game_pks)} games ready or at cutoff.")
+                if not run_pregame_predict(date, run_now):
+                    failures.append(f"predict:{','.join(run_now)}")
+            if retry_pks:
+                logger.info(
+                    f"Lineups not posted for {retry_pks}; retrying at {next_wake:%H:%M UTC} "
+                    f"without consuming an Odds API request."
+                )
+                wakes.append((next_wake, "predict", retry_pks, cluster_start))
+                wakes.sort(key=lambda wake: wake[0])
         else:
             snapshot(f"close@{wake_at:%H:%M}")
 

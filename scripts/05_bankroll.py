@@ -40,6 +40,7 @@ BET_LOG_COLUMNS = [
     "run_id", "model_version", "model_mode", "data_version", "feature_build_id",
     "model_training_data_version", "model_feature_build_id",
     "odds_event_id", "bookmaker_key", "bookmaker_title", "odds_snapshot_utc",
+    "price_selection_method", "book_prob_std", "book_prob_range", "execution_mode",
     "lineup_available", "umpire_available", "full_kelly", "uncapped_bet_size",
     "stake_limiting_rule", "daily_staked_before", "open_staked_before",
     "available_bankroll_before",
@@ -179,6 +180,13 @@ def cmd_log_bets(date, resume, force, game_pks=None):
             prob, odds = row["home_win_prob"], row["home_ml"]
         else:
             prob, odds = 1 - row["home_win_prob"], row["away_ml"]
+        side_prefix = side.lower()
+        bookmaker_key = row.get(f"{side_prefix}_bookmaker_key")
+        bookmaker_title = row.get(f"{side_prefix}_bookmaker_title")
+        if pd.isna(bookmaker_key):
+            bookmaker_key = row.get("bookmaker_key")
+        if pd.isna(bookmaker_title):
+            bookmaker_title = row.get("bookmaker_title")
 
         sizing = size_stake(prob, odds, state["bankroll"], daily_staked=daily_staked, open_staked=open_staked)
         stake = sizing.stake
@@ -201,8 +209,11 @@ def cmd_log_bets(date, resume, force, game_pks=None):
             "feature_build_id": row.get("feature_build_id"), "odds_event_id": row.get("odds_event_id"),
             "model_training_data_version": row.get("model_training_data_version"),
             "model_feature_build_id": row.get("model_feature_build_id"),
-            "bookmaker_key": row.get("bookmaker_key"), "bookmaker_title": row.get("bookmaker_title"),
+            "bookmaker_key": bookmaker_key, "bookmaker_title": bookmaker_title,
             "odds_snapshot_utc": row.get("odds_snapshot_utc"),
+            "price_selection_method": row.get("price_selection_method"),
+            "book_prob_std": row.get("book_prob_std"), "book_prob_range": row.get("book_prob_range"),
+            "execution_mode": row.get("execution_mode") if pd.notna(row.get("execution_mode")) else "paper",
             "lineup_available": row.get("lineup_available"), "umpire_available": row.get("umpire_available"),
             "full_kelly": sizing.full_kelly, "uncapped_bet_size": round(sizing.uncapped_stake, 2),
             "stake_limiting_rule": sizing.limiting_rule,

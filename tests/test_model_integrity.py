@@ -4,7 +4,7 @@ import sys
 import unittest
 import tempfile
 from unittest import mock
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +15,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from features import builder, props_builder  # noqa: E402
 from scripts.betting_strategy import size_stake  # noqa: E402
+from scripts.decision_log import append_decisions  # noqa: E402
+from scripts.odds_utils import aggregate_h2h_event  # noqa: E402
+from scripts.performance_metrics import date_block_roi_ci  # noqa: E402
 
 
 def load_numbered_script(name):
@@ -26,6 +29,23 @@ def load_numbered_script(name):
 
 
 class TemporalIntegrityTests(unittest.TestCase):
+    def test_production_cv_validates_each_season_on_prior_seasons_only(self):
+        training = load_numbered_script("02_train")
+        years = pd.Series([2021, 2021, 2022, 2022, 2023, 2023])
+        splitter = training.ExpandingYearSplit(years)
+        folds = list(splitter.split(pd.DataFrame({"x": range(len(years))})))
+        self.assertEqual(len(folds), 2)
+        for train_index, validation_index in folds:
+            self.assertLess(years.iloc[train_index].max(), years.iloc[validation_index].min())
+
+    def test_fold_imputation_handles_features_absent_in_early_seasons(self):
+        training = load_numbered_script("02_train")
+        features = pd.DataFrame({"known": [1.0, None, 3.0], "future_source": [None, None, 7.0]})
+        train, validation = training.fold_matrices(features, [0, 1], [2])
+        self.assertFalse(train.isna().any().any())
+        self.assertFalse(validation.isna().any().any())
+        self.assertEqual(validation.loc[2, "future_source"], 7.0)
+
     def test_appending_future_games_does_not_mutate_prior_rolling_features(self):
         rows = []
         for game_pk, day, home, away, hs, aws in [
@@ -157,6 +177,83 @@ class RiskAndMatchingTests(unittest.TestCase):
         self.assertEqual(set(matched), {"100", "101"})
         self.assertEqual({value["odds_event_id"] for value in matched.values()}, {"e1", "e2"})
 
+    def test_consensus_uses_best_executable_price_for_each_side(self):
+        event = {
+            "home_team": "Home", "away_team": "Away",
+            "bookmakers": [
+                {"key": "a", "title": "A", "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Home", "price": -120}, {"name": "Away", "price": 110},
+                ]}]},
+                {"key": "b", "title": "B", "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Home", "price": -115}, {"name": "Away", "price": 105},
+                ]}]},
+                {"key": "c", "title": "C", "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Home", "price": -125}, {"name": "Away", "price": 115},
+                ]}]},
+            ],
+        }
+        result = aggregate_h2h_event(event)
+        self.assertEqual(result["home_ml"], -115)
+        self.assertEqual(result["home_bookmaker_key"], "b")
+        self.assertEqual(result["away_ml"], 115)
+        self.assertEqual(result["away_bookmaker_key"], "c")
+        self.assertGreater(result["book_prob_range"], 0)
+
+    def test_lineup_poll_retries_then_forces_a_cutoff_decision(self):
+        capture = load_numbered_script("07_capture_closing_lines")
+        now = datetime(2026, 8, 20, 18, tzinfo=timezone.utc)
+        start = now + timedelta(hours=2)
+        run_now, retry, next_wake = capture.plan_lineup_decision(now, start, ["1", "2"], {"1"})
+        self.assertEqual(run_now, ["1"])
+        self.assertEqual(retry, ["2"])
+        self.assertEqual(next_wake, now + capture.LINEUP_POLL_INTERVAL)
+        at_cutoff = start - capture.PREGAME_DECISION_CUTOFF
+        run_now, retry, next_wake = capture.plan_lineup_decision(at_cutoff, start, ["2"], set())
+        self.assertEqual(run_now, ["2"])
+        self.assertEqual(retry, [])
+        self.assertIsNone(next_wake)
+
+    def test_decision_log_is_append_only_and_idempotent_per_run(self):
+        predictions = pd.DataFrame([{
+            "run_id": "predict_1", "game_pk": "999", "date": "2026-08-20",
+            "generated_at_utc": "2026-08-20T18:00:00+00:00",
+            "decision_eligible": False, "bet_flag": False,
+            "ineligibility_reason": "lineups_not_posted",
+        }])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "decision_log.csv"
+            self.assertEqual(append_decisions(predictions, path, "paper"), 1)
+            self.assertEqual(append_decisions(predictions, path, "paper"), 0)
+            logged = pd.read_csv(path, dtype={"game_pk": str})
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(logged.loc[0, "decision_status"], "ineligible")
+        self.assertEqual(logged.loc[0, "ineligibility_reason"], "lineups_not_posted")
+
+    def test_roi_uncertainty_resamples_whole_betting_dates(self):
+        records = pd.DataFrame({
+            "date": ["2026-08-01", "2026-08-01", "2026-08-02", "2026-08-02"],
+            "pnl": [100.0, -20.0, -50.0, -50.0],
+            "stake": [100.0, 100.0, 100.0, 100.0],
+        })
+        interval = date_block_roi_ci(records, n_bootstrap=1000)
+        self.assertEqual(len(interval), 2)
+        self.assertLess(interval[0], interval[1])
+
+    def test_forward_report_excludes_unattributed_legacy_bets(self):
+        report_module = load_numbered_script("08_forward_performance")
+        complete = {
+            "date": "2026-08-20", "bet_size": 100.0, "pnl": 10.0, "result": "win", "status": "settled",
+            "run_id": "predict_1", "model_version": "model_1", "model_mode": "production",
+            "data_version": "data_1", "feature_build_id": "features_1", "odds_event_id": "event_1",
+            "bookmaker_key": "book_1", "decision_timestamp": "2026-08-20T18:00:00Z",
+            "execution_mode": "paper", "clv": 0.01,
+        }
+        legacy = {"date": "2026-08-19", "bet_size": 100.0, "pnl": 5.0, "result": "win", "status": "settled"}
+        report = report_module.build_report(pd.DataFrame([complete, legacy]))
+        self.assertEqual(report["all_settled_history"]["n_bets"], 2)
+        self.assertEqual(report["auditable_production_forward"]["n_bets"], 1)
+        self.assertFalse(report["strategy_validated_forward"])
+
     def test_bankroll_log_preserves_lineage_and_caps_stake(self):
         bankroll = load_numbered_script("05_bankroll")
         with tempfile.TemporaryDirectory() as temp:
@@ -175,6 +272,8 @@ class RiskAndMatchingTests(unittest.TestCase):
                 "data_version": "data_test", "feature_build_id": "feature_test",
                 "odds_event_id": "event_test", "bookmaker_key": "book_test",
                 "bookmaker_title": "Book Test", "odds_snapshot_utc": datetime.now(timezone.utc).isoformat(),
+                "home_bookmaker_key": "best_home", "home_bookmaker_title": "Best Home",
+                "price_selection_method": "best_available_across_quoted_books", "execution_mode": "paper",
                 "lineup_available": True, "umpire_available": True,
             }]).to_csv(outputs / f"predictions_{date}.csv", index=False)
             with mock.patch.multiple(
@@ -185,6 +284,8 @@ class RiskAndMatchingTests(unittest.TestCase):
                 log = pd.read_csv(outputs / "bet_log.csv", dtype={"game_pk": str})
             self.assertEqual(log.loc[0, "model_version"], "model_test")
             self.assertEqual(log.loc[0, "odds_event_id"], "event_test")
+            self.assertEqual(log.loc[0, "bookmaker_key"], "best_home")
+            self.assertEqual(log.loc[0, "execution_mode"], "paper")
             self.assertLessEqual(log.loc[0, "bet_size"], 200.0)
 
 

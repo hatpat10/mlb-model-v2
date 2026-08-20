@@ -27,6 +27,7 @@ from odds_utils import american_to_decimal_odds  # noqa: E402
 from betting_strategy import american_to_decimal, size_stake  # noqa: E402
 from artifact_utils import atomic_write_json  # noqa: E402
 from model_registry import resolve_production_model_dir  # noqa: E402
+from performance_metrics import date_block_roi_ci  # noqa: E402
 
 RAW = PATHS["raw"]
 PROCESSED = PATHS["processed"]
@@ -64,6 +65,28 @@ def evaluate_accuracy(test_df, label="2024 holdout"):
     brier = brier_score_loss(y, p)
     logger.info(f"{label} — AUC={auc:.4f}  Accuracy={acc:.4f}  Brier={brier:.4f}")
     return auc, acc, brier
+
+
+def compare_model_to_market(scored_with_odds):
+    """Compare model and no-vig market probabilities on identical games."""
+    valid = scored_with_odds[["home_win", "model_home_prob", "home_no_vig_prob"]].dropna()
+    if valid.empty or valid["home_win"].nunique() < 2:
+        return None
+    y = valid["home_win"].astype(int)
+    model_prob = valid["model_home_prob"].astype(float)
+    market_prob = valid["home_no_vig_prob"].astype(float)
+    model_auc = roc_auc_score(y, model_prob)
+    market_auc = roc_auc_score(y, market_prob)
+    model_brier = brier_score_loss(y, model_prob)
+    market_brier = brier_score_loss(y, market_prob)
+    return {
+        "n_games": int(len(valid)),
+        "model_auc": float(model_auc), "market_auc": float(market_auc),
+        "model_minus_market_auc": float(model_auc - market_auc),
+        "model_brier": float(model_brier), "market_brier": float(market_brier),
+        "model_minus_market_brier": float(model_brier - market_brier),
+        "brier_note": "Negative model-minus-market is better.",
+    }
 
 
 def load_real_closing_lines():
@@ -118,7 +141,7 @@ def moneyline_roi(test_df, home_fair_prob, label, home_ml_close=None, away_ml_cl
         simulation["_away_ml"] = away_ml_close
         simulation = simulation.sort_values(["date", "game_pk"]).reset_index(drop=True)
         bankroll, peak, max_drawdown = 10000.0, 10000.0, 0.0
-        bet_pnls, bet_stakes = [], []
+        bet_records = []
         total_staked, total_pnl, n_bets = 0.0, 0.0, 0
         for _, day in simulation.groupby("date", sort=True):
             daily_staked = 0.0
@@ -141,20 +164,13 @@ def moneyline_roi(test_df, home_fair_prob, label, home_ml_close=None, away_ml_cl
                 total_pnl += bet_pnl
                 day_pnl += bet_pnl
                 n_bets += 1
-                bet_pnls.append(bet_pnl)
-                bet_stakes.append(sizing.stake)
+                bet_records.append({"date": str(row["date"]), "pnl": bet_pnl, "stake": sizing.stake})
             bankroll += day_pnl
             peak = max(peak, bankroll)
             max_drawdown = max(max_drawdown, 1.0 - bankroll / peak)
         final_bankroll = bankroll
-        if n_bets >= 2:
-            rng = np.random.default_rng(42)
-            idx = rng.integers(0, n_bets, size=(5000, n_bets))
-            pnl_arr, stake_arr = np.asarray(bet_pnls), np.asarray(bet_stakes)
-            bootstrap_roi = pnl_arr[idx].sum(axis=1) / stake_arr[idx].sum(axis=1)
-            roi_ci_95 = [float(value) for value in np.quantile(bootstrap_roi, [0.025, 0.975])]
-        else:
-            roi_ci_95 = None
+        bet_records = pd.DataFrame(bet_records)
+        roi_ci_95 = date_block_roi_ci(bet_records)
     roi = total_pnl / total_staked if total_staked > 0 else np.nan
 
     logger.info(f"ROI vs {label} closing lines: {n_bets} bets placed / {len(test_df)} games, "
@@ -167,6 +183,10 @@ def moneyline_roi(test_df, home_fair_prob, label, home_ml_close=None, away_ml_cl
         "final_bankroll": float(final_bankroll) if final_bankroll is not None else None,
         "max_drawdown": float(max_drawdown) if max_drawdown is not None else None,
         "roi_ci_95": roi_ci_95 if final_bankroll is not None else None,
+        "n_betting_days": int(bet_records["date"].nunique()) if final_bankroll is not None and not bet_records.empty else 0,
+        "bootstrap_unit": "betting_date" if final_bankroll is not None else None,
+        "evaluation_timing": "retrospective_at_captured_close" if final_bankroll is not None else "synthetic_proxy",
+        "forward_performance": False,
     }
 
 
@@ -176,7 +196,14 @@ def main():
     auc, acc, brier = evaluate_accuracy(test_df)
 
     real_odds = load_real_closing_lines()
-    results = {"auc": auc, "accuracy": acc, "brier": brier}
+    results = {
+        "report_type": "retrospective_model_and_closing_price_evaluation",
+        "interpretation": (
+            "Captured closing prices are used as both the decision market and payout price. "
+            "This is a close-time retrospective, not evidence of prices available at the live T-2h decision."
+        ),
+        "auc": auc, "accuracy": acc, "brier": brier,
+    }
 
     if real_odds is not None:
         # feature_matrix game_pk reads back as int64; odds files store it as
@@ -198,6 +225,7 @@ def main():
                 home_ml_close=merged["home_ml_close"].values, away_ml_close=merged["away_ml_close"].values,
             )
             results["roi_real"]["market_coverage"] = coverage
+            results["market_comparison"] = compare_model_to_market(merged)
         else:
             logger.warning("No holdout games matched real closing-line data by game_pk.")
     else:
@@ -240,18 +268,23 @@ def main():
                 )
                 results["roi_production_real"]["market_coverage"] = production_coverage
                 results["roi_production_real"]["model_version"] = production_manifest.get("model_version")
+                results["production_market_comparison"] = compare_model_to_market(production_merged)
 
     real_result = results.get("roi_production_real", results.get("roi_real", {}))
     results["validation_thresholds"] = {
         "minimum_real_bets": MIN_STRATEGY_VALIDATION_BETS,
         "minimum_market_coverage": MIN_STRATEGY_VALIDATION_COVERAGE,
     }
-    results["strategy_validated"] = bool(
+    results["strategy_validated_retrospective"] = bool(
         real_result.get("n_bets", 0) >= MIN_STRATEGY_VALIDATION_BETS
         and real_result.get("market_coverage", 0.0) >= MIN_STRATEGY_VALIDATION_COVERAGE
         and real_result.get("roi_ci_95") is not None
         and real_result["roi_ci_95"][0] > 0
     )
+    # Backward-compatible name, but the report now states explicitly that
+    # passing these gates only validates a close-time retrospective. The
+    # deployment gate lives in 08_forward_performance.py.
+    results["strategy_validated"] = results["strategy_validated_retrospective"]
 
     out_path = OUTPUTS / f"backtest_{TEST_YEAR}.json"
     atomic_write_json(results, out_path)
