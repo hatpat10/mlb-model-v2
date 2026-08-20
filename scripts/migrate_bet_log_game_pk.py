@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Backfill durable game identifiers into legacy bankroll rows.
+"""One-off migration for legacy bankroll rows that predate game_pk lineage.
 
-Prediction snapshots are authoritative because they preserve the game_pk
-known at decision time. A date-window lookup is used only as an explicit,
-warning-producing fallback and remains safe to re-run.
+Prediction snapshots are authoritative because they preserve the identifier
+known at decision time, including postponements and doubleheaders. This was
+confirmed against the motivating PIT@MIL and CIN@CLE cases, where a nearest-
+date match could select the wrong same-opponent game.
+
+When no prediction snapshot exists, the migration accepts only one uniquely
+nearest home-game match within +/-5 days. Tied/ambiguous matches are left
+unresolved for manual review. Writes are atomic and rows that already have a
+game_pk remain untouched, so the migration is safe to rerun.
 """
 import sys
 from pathlib import Path

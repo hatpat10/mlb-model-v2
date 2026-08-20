@@ -34,7 +34,7 @@ logger.add(LOG_PATH, level="DEBUG", rotation="5 MB")
 
 LINEAGE_COLUMNS = [
     "run_id", "model_version", "model_mode", "data_version", "feature_build_id",
-    "odds_event_id", "bookmaker_key", "decision_timestamp", "execution_mode",
+    "odds_event_id", "bookmaker_key", "price_universe", "decision_timestamp", "start_utc", "execution_mode",
 ]
 
 
@@ -52,12 +52,29 @@ def build_report(ledger: pd.DataFrame, starting_bankroll: float = 10000.0) -> di
     lineage_mask = pd.Series(True, index=settled.index)
     for column in LINEAGE_COLUMNS:
         lineage_mask &= _present(settled[column])
+    decision_time = pd.to_datetime(settled["decision_timestamp"], utc=True, errors="coerce")
+    start_time = pd.to_datetime(settled["start_utc"], utc=True, errors="coerce")
+    prestart_mask = decision_time.notna() & start_time.notna() & decision_time.lt(start_time)
+    lineage_mask &= prestart_mask
     production_mask = settled["model_mode"].astype(str).str.lower().eq("production")
     auditable = settled[lineage_mask & production_mask].copy()
+    configured_price_mask = auditable["price_universe"].astype(str).ne("all_quoted_books")
+    deployable = auditable[configured_price_mask].copy()
 
     all_metrics = summarize_settled_bets(settled, starting_bankroll)
     auditable_metrics = summarize_settled_bets(auditable, starting_bankroll)
-    ci = auditable_metrics.get("roi_ci_95_date_block")
+    auditable_lead = (
+        pd.to_datetime(auditable["start_utc"], utc=True, errors="coerce")
+        - pd.to_datetime(auditable["decision_timestamp"], utc=True, errors="coerce")
+    ).dt.total_seconds() / 60.0
+    auditable_metrics["mean_decision_lead_minutes"] = (
+        float(auditable_lead.mean()) if auditable_lead.notna().any() else None
+    )
+    auditable_metrics["minimum_decision_lead_minutes"] = (
+        float(auditable_lead.min()) if auditable_lead.notna().any() else None
+    )
+    deployable_metrics = summarize_settled_bets(deployable, starting_bankroll)
+    ci = deployable_metrics.get("roi_ci_95_date_block")
     gates = {
         "minimum_auditable_bets": MIN_STRATEGY_VALIDATION_BETS,
         "minimum_auditable_betting_days": MIN_FORWARD_VALIDATION_BETTING_DAYS,
@@ -66,11 +83,11 @@ def build_report(ledger: pd.DataFrame, starting_bankroll: float = 10000.0) -> di
         "positive_mean_clv": True,
     }
     passed = {
-        "minimum_auditable_bets": auditable_metrics["n_bets"] >= MIN_STRATEGY_VALIDATION_BETS,
-        "minimum_auditable_betting_days": auditable_metrics["n_betting_days"] >= MIN_FORWARD_VALIDATION_BETTING_DAYS,
-        "minimum_clv_coverage": auditable_metrics["clv_coverage"] >= MIN_FORWARD_VALIDATION_CLV_COVERAGE,
+        "minimum_auditable_bets": deployable_metrics["n_bets"] >= MIN_STRATEGY_VALIDATION_BETS,
+        "minimum_auditable_betting_days": deployable_metrics["n_betting_days"] >= MIN_FORWARD_VALIDATION_BETTING_DAYS,
+        "minimum_clv_coverage": deployable_metrics["clv_coverage"] >= MIN_FORWARD_VALIDATION_CLV_COVERAGE,
         "positive_date_block_roi_ci_lower_bound": ci is not None and ci[0] > 0,
-        "positive_mean_clv": auditable_metrics["mean_clv"] is not None and auditable_metrics["mean_clv"] > 0,
+        "positive_mean_clv": deployable_metrics["mean_clv"] is not None and deployable_metrics["mean_clv"] > 0,
     }
     execution_modes = sorted(auditable["execution_mode"].dropna().astype(str).str.lower().unique().tolist())
     return {
@@ -83,8 +100,10 @@ def build_report(ledger: pd.DataFrame, starting_bankroll: float = 10000.0) -> di
         "execution_modes": execution_modes,
         "all_settled_history": all_metrics,
         "auditable_production_forward": auditable_metrics,
+        "deployable_configured_book_forward": deployable_metrics,
         "lineage_complete_settled_bets": int(lineage_mask.sum()),
         "lineage_coverage": float(lineage_mask.mean()) if len(settled) else 0.0,
+        "settled_bets_not_provably_prestart": int((~prestart_mask).sum()),
         "validation_thresholds": gates,
         "validation_gates_passed": passed,
         "strategy_validated_forward": bool(all(passed.values())),
@@ -103,9 +122,9 @@ def main():
             starting = float(json.load(handle).get("starting_bankroll", starting))
     report = build_report(ledger, starting)
     atomic_write_json(report, REPORT_PATH)
-    metrics = report["auditable_production_forward"]
+    metrics = report["deployable_configured_book_forward"]
     logger.info(
-        f"Forward evidence: {metrics['n_bets']} auditable production bets across "
+        f"Forward evidence: {metrics['n_bets']} deployable configured-book production bets across "
         f"{metrics['n_betting_days']} days; ROI={metrics['roi']}; "
         f"validated={report['strategy_validated_forward']} -> {REPORT_PATH}"
     )

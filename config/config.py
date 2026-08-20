@@ -4,8 +4,10 @@
 import os
 from datetime import date
 from pathlib import Path
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 PATHS = {
     "root": PROJECT_ROOT,
@@ -40,6 +42,11 @@ REQUIRE_UMPIRE_FOR_BET = False
 BETTING_EXECUTION_MODE = os.getenv("BETTING_EXECUTION_MODE", "paper").strip().lower()
 if BETTING_EXECUTION_MODE not in {"paper", "live"}:
     raise ValueError("BETTING_EXECUTION_MODE must be 'paper' or 'live'")
+BETTING_BOOKMAKERS = tuple(dict.fromkeys(
+    key.strip().lower() for key in os.getenv("BETTING_BOOKMAKERS", "").split(",") if key.strip()
+))
+if BETTING_EXECUTION_MODE == "live" and not BETTING_BOOKMAKERS:
+    raise ValueError("Live execution requires BETTING_BOOKMAKERS with at least one executable book key")
 PREGAME_PREDICT_LEAD_HOURS = 2
 LINEUP_POLL_INTERVAL_MINUTES = 10
 PREGAME_DECISION_CUTOFF_MINUTES = 15

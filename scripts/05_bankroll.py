@@ -36,11 +36,13 @@ POSTPONED_GRACE_DAYS = 5
 BET_LOG_COLUMNS = [
     "date", "home_team", "away_team", "side", "bet_size", "odds", "no_vig_prob",
     "result", "pnl", "closing_no_vig_prob", "clv", "status",
-    "game_pk", "decision_id", "model_home_prob", "edge", "decision_timestamp",
+    "game_pk", "decision_id", "model_home_prob", "xgb_home_win_prob", "lgbm_home_win_prob",
+    "model_disagreement", "edge", "decision_timestamp", "start_utc", "decision_lead_minutes",
     "run_id", "model_version", "model_mode", "data_version", "feature_build_id",
     "model_training_data_version", "model_feature_build_id",
     "odds_event_id", "bookmaker_key", "bookmaker_title", "odds_snapshot_utc",
-    "price_selection_method", "book_prob_std", "book_prob_range", "execution_mode",
+    "price_selection_method", "price_universe", "n_executable_books",
+    "book_prob_std", "book_prob_range", "execution_mode",
     "lineup_available", "umpire_available", "full_kelly", "uncapped_bet_size",
     "stake_limiting_rule", "daily_staked_before", "open_staked_before",
     "available_bankroll_before",
@@ -135,7 +137,10 @@ def cmd_log_bets(date, resume, force, game_pks=None):
         logger.error(f"{pred_path} not found — run scripts/04_predict.py --date {date} first.")
         sys.exit(1)
     preds = pd.read_csv(pred_path, dtype={"game_pk": str})
-    required = {"date", "game_pk", "home_team", "away_team", "bet_flag", "decision_eligible", "bet_side", "home_win_prob", "home_ml", "away_ml", "run_id", "generated_at_utc"}
+    required = {
+        "date", "game_pk", "home_team", "away_team", "bet_flag", "decision_eligible",
+        "bet_side", "home_win_prob", "home_ml", "away_ml", "run_id", "generated_at_utc", "start_utc",
+    }
     missing = required - set(preds.columns)
     if missing:
         logger.error(f"Prediction artifact is not auditable; missing columns: {sorted(missing)}")
@@ -163,6 +168,14 @@ def cmd_log_bets(date, resume, force, game_pks=None):
         logger.info(f"No bets flagged for {date}.")
         return
 
+    decision_times = pd.to_datetime(flagged["generated_at_utc"], utc=True, errors="coerce")
+    start_times = pd.to_datetime(flagged["start_utc"], utc=True, errors="coerce")
+    invalid_timing = decision_times.isna() | start_times.isna() | decision_times.ge(start_times)
+    if invalid_timing.any():
+        bad_game_pks = flagged.loc[invalid_timing, "game_pk"].astype(str).tolist()
+        logger.error(f"Refusing to log bets without a provable pre-first-pitch timestamp: {bad_game_pks}")
+        sys.exit(1)
+
     already_logged = set(bet_log.loc[bet_log["date"].astype(str) == date, "game_pk"].dropna().astype(str))
     if already_logged:
         logger.warning(f"{len(already_logged)} bet(s) already logged for {date} — skipping to avoid double-staking. "
@@ -187,6 +200,9 @@ def cmd_log_bets(date, resume, force, game_pks=None):
             bookmaker_key = row.get("bookmaker_key")
         if pd.isna(bookmaker_title):
             bookmaker_title = row.get("bookmaker_title")
+        decision_time = pd.to_datetime(row["generated_at_utc"], utc=True)
+        start_time = pd.to_datetime(row["start_utc"], utc=True)
+        decision_lead_minutes = (start_time - decision_time).total_seconds() / 60.0
 
         sizing = size_stake(prob, odds, state["bankroll"], daily_staked=daily_staked, open_staked=open_staked)
         stake = sizing.stake
@@ -202,8 +218,13 @@ def cmd_log_bets(date, resume, force, game_pks=None):
             "result": np.nan, "pnl": np.nan, "closing_no_vig_prob": np.nan, "clv": np.nan,
             "status": "pending",
             "game_pk": game_pk, "decision_id": f"{date}_{game_pk}_{side}",
-            "model_home_prob": row.get("home_win_prob", np.nan), "edge": row.get("edge", np.nan),
+            "model_home_prob": row.get("home_win_prob", np.nan),
+            "xgb_home_win_prob": row.get("xgb_home_win_prob", np.nan),
+            "lgbm_home_win_prob": row.get("lgbm_home_win_prob", np.nan),
+            "model_disagreement": row.get("model_disagreement", np.nan),
+            "edge": row.get("edge", np.nan),
             "decision_timestamp": row["generated_at_utc"],
+            "start_utc": row["start_utc"], "decision_lead_minutes": decision_lead_minutes,
             "run_id": row["run_id"], "model_version": row.get("model_version"),
             "model_mode": row.get("model_mode"), "data_version": row.get("data_version"),
             "feature_build_id": row.get("feature_build_id"), "odds_event_id": row.get("odds_event_id"),
@@ -212,6 +233,8 @@ def cmd_log_bets(date, resume, force, game_pks=None):
             "bookmaker_key": bookmaker_key, "bookmaker_title": bookmaker_title,
             "odds_snapshot_utc": row.get("odds_snapshot_utc"),
             "price_selection_method": row.get("price_selection_method"),
+            "price_universe": row.get("price_universe"),
+            "n_executable_books": row.get("n_executable_books"),
             "book_prob_std": row.get("book_prob_std"), "book_prob_range": row.get("book_prob_range"),
             "execution_mode": row.get("execution_mode") if pd.notna(row.get("execution_mode")) else "paper",
             "lineup_available": row.get("lineup_available"), "umpire_available": row.get("umpire_available"),

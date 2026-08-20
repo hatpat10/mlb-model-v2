@@ -199,6 +199,13 @@ class RiskAndMatchingTests(unittest.TestCase):
         self.assertEqual(result["away_bookmaker_key"], "c")
         self.assertGreater(result["book_prob_range"], 0)
 
+        restricted = aggregate_h2h_event(event, allowed_bookmakers=["a"])
+        self.assertEqual(restricted["home_bookmaker_key"], "a")
+        self.assertEqual(restricted["away_bookmaker_key"], "a")
+        self.assertEqual(restricted["n_books"], 3)
+        self.assertEqual(restricted["n_executable_books"], 1)
+        self.assertEqual(restricted["price_universe"], "a")
+
     def test_lineup_poll_retries_then_forces_a_cutoff_decision(self):
         capture = load_numbered_script("07_capture_closing_lines")
         now = datetime(2026, 8, 20, 18, tzinfo=timezone.utc)
@@ -246,12 +253,15 @@ class RiskAndMatchingTests(unittest.TestCase):
             "run_id": "predict_1", "model_version": "model_1", "model_mode": "production",
             "data_version": "data_1", "feature_build_id": "features_1", "odds_event_id": "event_1",
             "bookmaker_key": "book_1", "decision_timestamp": "2026-08-20T18:00:00Z",
+            "start_utc": "2026-08-20T20:00:00Z",
+            "price_universe": "book_1",
             "execution_mode": "paper", "clv": 0.01,
         }
         legacy = {"date": "2026-08-19", "bet_size": 100.0, "pnl": 5.0, "result": "win", "status": "settled"}
         report = report_module.build_report(pd.DataFrame([complete, legacy]))
         self.assertEqual(report["all_settled_history"]["n_bets"], 2)
         self.assertEqual(report["auditable_production_forward"]["n_bets"], 1)
+        self.assertEqual(report["deployable_configured_book_forward"]["n_bets"], 1)
         self.assertFalse(report["strategy_validated_forward"])
 
     def test_bankroll_log_preserves_lineage_and_caps_stake(self):
@@ -272,6 +282,7 @@ class RiskAndMatchingTests(unittest.TestCase):
                 "data_version": "data_test", "feature_build_id": "feature_test",
                 "odds_event_id": "event_test", "bookmaker_key": "book_test",
                 "bookmaker_title": "Book Test", "odds_snapshot_utc": datetime.now(timezone.utc).isoformat(),
+                "start_utc": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
                 "home_bookmaker_key": "best_home", "home_bookmaker_title": "Best Home",
                 "price_selection_method": "best_available_across_quoted_books", "execution_mode": "paper",
                 "lineup_available": True, "umpire_available": True,
@@ -286,7 +297,31 @@ class RiskAndMatchingTests(unittest.TestCase):
             self.assertEqual(log.loc[0, "odds_event_id"], "event_test")
             self.assertEqual(log.loc[0, "bookmaker_key"], "best_home")
             self.assertEqual(log.loc[0, "execution_mode"], "paper")
+            self.assertGreater(log.loc[0, "decision_lead_minutes"], 0)
             self.assertLessEqual(log.loc[0, "bet_size"], 200.0)
+
+    def test_bankroll_refuses_a_post_first_pitch_decision(self):
+        bankroll = load_numbered_script("05_bankroll")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            outputs, models = root / "outputs", root / "models"
+            outputs.mkdir()
+            models.mkdir()
+            date = "2026-08-20"
+            pd.DataFrame([{
+                "date": date, "game_pk": "999", "home_team": "NYY", "away_team": "BOS",
+                "bet_flag": True, "decision_eligible": True, "bet_side": "HOME",
+                "home_win_prob": 0.65, "home_ml": 120, "away_ml": -130,
+                "run_id": "predict_late", "generated_at_utc": "2026-08-20T20:01:00Z",
+                "start_utc": "2026-08-20T20:00:00Z",
+            }]).to_csv(outputs / f"predictions_{date}.csv", index=False)
+            with mock.patch.multiple(
+                bankroll, OUTPUTS=outputs, MODELS=models,
+                STATE_PATH=models / "bankroll_state.json", BET_LOG_PATH=outputs / "bet_log.csv",
+            ):
+                with self.assertRaises(SystemExit):
+                    bankroll.cmd_log_bets(date, resume=False, force=False, game_pks=["999"])
+            self.assertFalse((outputs / "bet_log.csv").exists())
 
 
 if __name__ == "__main__":

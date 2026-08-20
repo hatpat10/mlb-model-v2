@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config.config import (  # noqa: E402
     PATHS, PREGAME_PREDICT_LEAD_HOURS, LINEUP_POLL_INTERVAL_MINUTES,
-    PREGAME_DECISION_CUTOFF_MINUTES,
+    PREGAME_DECISION_CUTOFF_MINUTES, BETTING_BOOKMAKERS,
 )
 from odds_utils import aggregate_h2h_event, fetch_slate, MIN_BOOKMAKERS  # noqa: E402
 from artifact_utils import atomic_write_csv  # noqa: E402
@@ -109,7 +109,10 @@ def match_events_to_slate(events: list, slate: pd.DataFrame, date: str) -> dict:
         if matches.empty:
             logger.warning(f"Odds event has no schedule match: {event.get('away_team')} @ {event.get('home_team')}")
             continue
-        agg = aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS)
+        agg = aggregate_h2h_event(
+            event, min_bookmakers=MIN_BOOKMAKERS,
+            allowed_bookmakers=BETTING_BOOKMAKERS or None,
+        )
         if agg is None:
             continue
         event_key = event.get("id") or f"event_{event_index}"
@@ -159,6 +162,7 @@ def write_snapshot(date: str, slate: pd.DataFrame, matched: dict, now_utc: datet
             "commence_time_utc": g["start_utc"].isoformat(),
             "snapshot_time_utc": now_utc.isoformat(),
             "n_books": agg["n_books"],
+            "n_executable_books": agg.get("n_executable_books"),
             "odds_event_id": agg.get("odds_event_id"),
             "bookmaker_key": agg.get("bookmaker_key"),
             "bookmaker_title": agg.get("bookmaker_title"),
@@ -172,6 +176,7 @@ def write_snapshot(date: str, slate: pd.DataFrame, matched: dict, now_utc: datet
             "book_prob_std": agg.get("book_prob_std"),
             "book_prob_range": agg.get("book_prob_range"),
             "price_selection_method": agg.get("price_selection_method"),
+            "price_universe": agg.get("price_universe"),
             "home_ml_close": agg["home_ml"],
             "away_ml_close": agg["away_ml"],
             "home_no_vig_prob": agg["no_vig_home_implied"],

@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config.config import (  # noqa: E402
     PATHS, MIN_EDGE_MONEYLINE, MAX_EDGE_MONEYLINE, TEAM_ABBREV_MAP,
     REQUIRE_POSTED_LINEUPS_FOR_BET, REQUIRE_UMPIRE_FOR_BET, BETTING_EXECUTION_MODE,
+    BETTING_BOOKMAKERS,
 )
 from model_classes import WeightedEnsembleClassifier, PreFitCalibratedClassifier  # noqa: E402
 from odds_utils import aggregate_h2h_event  # noqa: E402
@@ -126,7 +127,10 @@ def fetch_moneyline_odds() -> pd.DataFrame:
         # Per-book de-vig then median across books — see odds_utils for why
         # this must never be an average of raw American prices, and why
         # fewer than MIN_BOOKMAKERS books means no usable consensus.
-        agg = aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS)
+        agg = aggregate_h2h_event(
+            event, min_bookmakers=MIN_BOOKMAKERS,
+            allowed_bookmakers=BETTING_BOOKMAKERS or None,
+        )
         if agg is None:
             continue
 
@@ -151,6 +155,7 @@ def fetch_moneyline_odds() -> pd.DataFrame:
             "home_ml": agg["home_ml"], "away_ml": agg["away_ml"],
             "no_vig_home_implied": agg["no_vig_home_implied"],
             "n_books": agg["n_books"],
+            "n_executable_books": agg.get("n_executable_books"),
             "bookmaker_key": agg.get("bookmaker_key"),
             "bookmaker_title": agg.get("bookmaker_title"),
             "bookmaker_last_update": agg.get("bookmaker_last_update"),
@@ -163,6 +168,7 @@ def fetch_moneyline_odds() -> pd.DataFrame:
             "book_prob_std": agg.get("book_prob_std"),
             "book_prob_range": agg.get("book_prob_range"),
             "price_selection_method": agg.get("price_selection_method"),
+            "price_universe": agg.get("price_universe"),
         })
     return pd.DataFrame(rows)
 
@@ -363,8 +369,12 @@ def main():
             game_df[col] = np.nan
     X_today = game_df[features].fillna(medians)
 
-    home_prob = (xgb_cal.predict_proba(X_today)[:, 1] + lgbm_cal.predict_proba(X_today)[:, 1]) / 2.0
-    game_df["home_win_prob"] = home_prob
+    xgb_home_prob = xgb_cal.predict_proba(X_today)[:, 1]
+    lgbm_home_prob = lgbm_cal.predict_proba(X_today)[:, 1]
+    game_df["xgb_home_win_prob"] = xgb_home_prob
+    game_df["lgbm_home_win_prob"] = lgbm_home_prob
+    game_df["model_disagreement"] = np.abs(xgb_home_prob - lgbm_home_prob)
+    game_df["home_win_prob"] = (xgb_home_prob + lgbm_home_prob) / 2.0
 
     # game_df only carries team abbreviations, but the odds feed matches on
     # full team names, so bring those in from the original schedule payload first.

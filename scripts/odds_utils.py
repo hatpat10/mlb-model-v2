@@ -66,7 +66,7 @@ def american_to_decimal_odds(odds):
         return np.where(odds < 0, 1 + 100 / -odds, 1 + odds / 100)
 
 
-def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
+def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS, allowed_bookmakers=None):
     """Collapse one The-Odds-API event's h2h books into a market consensus.
 
     Aggregates books as no-vig PROBABILITIES, never as raw American prices.
@@ -81,8 +81,10 @@ def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
     a single stale/outlier book (e.g. one already showing an
     in-play-looking price like -10000) isn't a market consensus.
 
-    Otherwise returns a dict with a consensus probability plus the best
-    independently executable price for each side across the quoted books.
+    Otherwise returns a dict with a consensus probability across all quoted
+    books plus the best independently executable price for each side. When
+    `allowed_bookmakers` is provided, price selection is restricted to those
+    book keys while the broader market still supplies the consensus.
     The consensus determines edge; the side-specific best price determines
     payout and stake. This explicitly models line shopping and never creates
     a synthetic American price.
@@ -120,8 +122,14 @@ def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
     no_vig_home_implied = float(np.median(book_no_vig_home))
     closest_idx = int(np.argmin(np.abs(np.array(book_no_vig_home) - no_vig_home_implied)))
     representative = book_prices[closest_idx]
-    best_home = max(book_prices, key=lambda price: float(price["home_ml"]))
-    best_away = max(book_prices, key=lambda price: float(price["away_ml"]))
+    allowed = {str(key).lower() for key in allowed_bookmakers or []}
+    executable_prices = [
+        price for price in book_prices if not allowed or str(price.get("bookmaker_key", "")).lower() in allowed
+    ]
+    if not executable_prices:
+        return None
+    best_home = max(executable_prices, key=lambda price: float(price["home_ml"]))
+    best_away = max(executable_prices, key=lambda price: float(price["away_ml"]))
     probabilities = np.asarray(book_no_vig_home, dtype=float)
 
     return {
@@ -141,6 +149,10 @@ def aggregate_h2h_event(event, min_bookmakers=MIN_BOOKMAKERS):
         "bookmaker_last_update": representative.get("bookmaker_last_update"),
         "book_prob_std": float(probabilities.std(ddof=0)),
         "book_prob_range": float(probabilities.max() - probabilities.min()),
-        "price_selection_method": "best_available_across_quoted_books",
+        "price_selection_method": (
+            "best_available_across_configured_books" if allowed else "best_available_across_quoted_books"
+        ),
+        "price_universe": ",".join(sorted(allowed)) if allowed else "all_quoted_books",
         "n_books": len(book_no_vig_home),
+        "n_executable_books": len(executable_prices),
     }

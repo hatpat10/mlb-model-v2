@@ -54,8 +54,10 @@ tracked history; regenerated prediction workbooks are not evidence records.
 ## Setup
 
 1. `python -m venv venv` then `venv\Scripts\python.exe -m pip install -r requirements.txt`; R 4.3 + `renv::restore()`.
-2. `.env` (never committed): `ODDS_API_KEY=...` (required),
-   `SPORTSDATAIO_API_KEY=...` (optional).
+2. Copy `.env.example` to `.env` and set `ODDS_API_KEY` (required) plus
+   `SPORTSDATAIO_API_KEY` (optional). Keep `BETTING_EXECUTION_MODE=paper` while
+   validation is false. If switching to `live`, `BETTING_BOOKMAKERS` is required;
+   prices will then be selected only from those executable book keys.
 3. `Rscript R/00_run_all.R`, then:
    `scripts/01_build_features.py` → `scripts/02_train.py --mode production` →
    `scripts/04_predict.py --date YYYY-MM-DD`.

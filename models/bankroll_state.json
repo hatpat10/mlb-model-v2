@@ -1,6 +1,7 @@
 {
-  "bankroll": 12959.186610979887,
-  "peak_bankroll": 14324.828610979886,
+  "bankroll": 12959.19,
+  "is_paused": false,
+  "peak_bankroll": 14912.15,
   "starting_bankroll": 10000.0,
-  "is_paused": false
+  "updated_at_utc": "2026-08-20T06:25:10+00:00"
 }

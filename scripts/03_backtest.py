@@ -51,8 +51,13 @@ def load_scored_rows(model_dir=MODELS, start_year=TEST_YEAR):
     scored = df[df["year"] >= start_year].reset_index(drop=True)
     X_test = scored[features].fillna(medians)
 
-    home_prob = (xgb_cal.predict_proba(X_test)[:, 1] + lgbm_cal.predict_proba(X_test)[:, 1]) / 2.0
+    xgb_prob = xgb_cal.predict_proba(X_test)[:, 1]
+    lgbm_prob = lgbm_cal.predict_proba(X_test)[:, 1]
+    home_prob = (xgb_prob + lgbm_prob) / 2.0
     scored = scored.copy()
+    scored["xgb_home_prob"] = xgb_prob
+    scored["lgbm_home_prob"] = lgbm_prob
+    scored["model_disagreement"] = np.abs(xgb_prob - lgbm_prob)
     scored["model_home_prob"] = home_prob
     return scored
 
@@ -87,6 +92,41 @@ def compare_model_to_market(scored_with_odds):
         "model_minus_market_brier": float(model_brier - market_brier),
         "brier_note": "Negative model-minus-market is better.",
     }
+
+
+def disagreement_diagnostics(scored):
+    """Measure whether component-model disagreement identifies weak predictions."""
+    valid = scored[["home_win", "model_home_prob", "model_disagreement"]].dropna().copy()
+    if valid.empty:
+        return None
+    valid["absolute_error"] = (valid["home_win"] - valid["model_home_prob"]).abs()
+    valid["squared_error"] = (valid["home_win"] - valid["model_home_prob"]) ** 2
+    correlation = valid["model_disagreement"].corr(valid["absolute_error"])
+    labels = ["lowest", "low_mid", "high_mid", "highest"]
+    valid["quartile"] = pd.qcut(
+        valid["model_disagreement"].rank(method="first"), 4, labels=labels,
+    )
+    by_quartile = {}
+    for label, group in valid.groupby("quartile", observed=True):
+        by_quartile[str(label)] = {
+            "n_games": int(len(group)),
+            "mean_disagreement": float(group["model_disagreement"].mean()),
+            "brier": float(group["squared_error"].mean()),
+        }
+    return {
+        "mean": float(valid["model_disagreement"].mean()),
+        "p95": float(valid["model_disagreement"].quantile(0.95)),
+        "maximum": float(valid["model_disagreement"].max()),
+        "correlation_with_absolute_error": float(correlation) if pd.notna(correlation) else None,
+        "by_disagreement_quartile": by_quartile,
+    }
+
+
+def price_method_summary(real_odds):
+    if "price_selection_method" not in real_odds.columns:
+        return {"legacy_representative_book_close": int(len(real_odds))}
+    methods = real_odds["price_selection_method"].fillna("legacy_representative_book_close").astype(str)
+    return {key: int(value) for key, value in methods.value_counts().items()}
 
 
 def load_real_closing_lines():
@@ -203,9 +243,11 @@ def main():
             "This is a close-time retrospective, not evidence of prices available at the live T-2h decision."
         ),
         "auc": auc, "accuracy": acc, "brier": brier,
+        "model_disagreement": disagreement_diagnostics(test_df),
     }
 
     if real_odds is not None:
+        results["closing_price_selection_methods"] = price_method_summary(real_odds)
         # feature_matrix game_pk reads back as int64; odds files store it as
         # str — without this cast the merge silently matches zero rows.
         oos = scored.copy()
@@ -249,6 +291,7 @@ def main():
         if not production_scored.empty:
             pa, pc, pb = evaluate_accuracy(production_scored, f"production {production_start}+ out-of-sample")
             results["production_accuracy"] = {"auc": pa, "accuracy": pc, "brier": pb}
+            results["production_model_disagreement"] = disagreement_diagnostics(production_scored)
             production_scored["game_pk"] = production_scored["game_pk"].astype(str)
             production_odds = real_odds.drop_duplicates("game_pk", keep="last").drop(
                 columns=[column for column in ("date", "home_team", "away_team") if column in real_odds.columns]
